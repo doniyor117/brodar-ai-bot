@@ -147,6 +147,9 @@ async def telegram_webhook(
     """
     Telegram Webhook endpoint.
     Validates the custom secret token header and forwards updates to aiogram dispatcher.
+    CRITICAL: Processes updates in a background task so the webhook returns 200 immediately.
+    Without this, LLM calls (5-30s) block the webhook response, causing Telegram to
+    timeout and stop delivering all future updates.
     """
     # 1. Verify Secret Token Header for security
     if not x_telegram_bot_api_secret_token or x_telegram_bot_api_secret_token != config.WEBHOOK_SECRET_TOKEN:
@@ -156,19 +159,28 @@ async def telegram_webhook(
             detail="Access forbidden: Invalid secret token"
         )
 
-    # 2. Parse and validate the update
+    # 2. Parse and validate the update, then process in background
     try:
         update_json = await request.json()
         update = Update.model_validate(update_json, context={"bot": bot})
         
-        # Feed update to the dispatcher (aiogram handles concurrency internally)
-        await dp.feed_update(bot, update)
+        # Process update in a background task — return 200 to Telegram IMMEDIATELY.
+        # This is critical: if we `await` dp.feed_update here, LLM generation
+        # blocks the webhook response for 5-30s. Telegram's webhook timeout
+        # triggers retries, and eventually Telegram stops sending updates entirely.
+        asyncio.create_task(_safe_process_update(update))
         
         return {"ok": True}
     except Exception as e:
         logger.error(f"Error processing webhook update: {e}", exc_info=True)
-        # Even if processing fails, return 200 OK to Telegram to avoid retries
         return {"ok": False, "error": str(e)}
+
+async def _safe_process_update(update: Update):
+    """Process a Telegram update in the background with full error handling."""
+    try:
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        logger.error(f"Error in background update processing: {e}", exc_info=True)
 
 if __name__ == "__main__":
     # Start the server locally

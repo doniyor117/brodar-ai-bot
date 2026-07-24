@@ -35,7 +35,10 @@ class AccessControlMiddleware(BaseMiddleware):
         if chat_type == "private":
             if not user_id or not await cache.is_user_allowed(user_id):
                 logger.info(f"Access restricted for DM user ID: {user_id}")
-                await message.reply(f"access restricted. user ID {user_id} is not in the DM allowlist. ask an admin to run /allow_user {user_id}.")
+                try:
+                    await message.reply(f"access restricted. user ID {user_id} is not in the DM allowlist. ask an admin to run /allow_user {user_id}.")
+                except Exception as reply_err:
+                    logger.error(f"Failed to send access restricted reply: {reply_err}")
                 return
             return await handler(event, data)
 
@@ -596,11 +599,11 @@ async def handle_chat_message(message: Message, bot: Bot):
     user_msg_entry = {"role": "user", "content": cleaned_text}
     temp_history = history + [user_msg_entry]
 
-    current_task = asyncio.current_task()
-    if current_task:
-        agent.register_running_task(chat_id, current_task)
-
     try:
+        current_task = asyncio.current_task()
+        if current_task:
+            agent.register_running_task(chat_id, current_task)
+
         async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
             logger.info(f"Generating agent response for chat {chat_id}...")
             bot_reply = await agent.generate_response(temp_history, bot_instance=bot, chat_id=chat_id)
@@ -622,4 +625,3 @@ async def handle_chat_message(message: Message, bot: Bot):
             logger.error(f"Failed to send error message: {send_err}")
     finally:
         agent.unregister_running_task(chat_id)
-
