@@ -215,7 +215,8 @@ async def cmd_help(message: Message):
         "- /deactivate (authorized users): disable bot in group.\n"
         "- /allow_user <id> (authorized users): grant DM access to a user.\n"
         "- /disallow_user <id> (authorized users): revoke DM access.\n"
-        "- /toggle_reply (group admins): toggle mention-only vs reply-all mode."
+        "- /toggle_reply (group admins): toggle mention-only vs reply-all mode.\n"
+        "- /toggle_tools (admins): show or hide the tool-activity clues."
     )
     await message.reply(text)
 
@@ -233,6 +234,21 @@ async def cmd_toggle_reply(message: Message, bot: Bot):
     cache.set_chat_setting(chat_id, not current)
     mode = "mention-only" if not current else "free-reply"
     await message.reply(f"reply mode switched to: {mode}.")
+
+@router.message(Command("toggle_tools"))
+async def cmd_toggle_tools(message: Message, bot: Bot):
+    """Toggles whether the bot shows '🔍 searching...' tool-activity notes in this chat."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can change this.")
+        return
+    chat_id = message.chat.id
+    current = await cache.get_chat_tool_notes(chat_id)
+    cache.set_chat_tool_notes(chat_id, not current)
+    if current:
+        await message.reply("tool clues hidden. i'll work quietly from now on.")
+    else:
+        await message.reply("tool clues on. i'll show you what i'm doing (🔍 ⚙️ 🧠).")
+
 
 @router.message(Command("activate"))
 async def cmd_activate(message: Message):
@@ -286,7 +302,8 @@ async def cmd_status(message: Message):
     chat_id = message.chat.id
     active = await cache.get_chat_active(chat_id) if message.chat.type != "private" else True
     mention_only = await cache.get_chat_setting(chat_id) if message.chat.type != "private" else False
-    
+    show_tool_notes = await cache.get_chat_tool_notes(chat_id)
+
     import tools
     # Run blocking subprocess calls off the event loop.
     uptime = (await asyncio.to_thread(tools.execute_shell_command, "uptime", "")).strip()
@@ -297,6 +314,7 @@ async def cmd_status(message: Message):
         f"- chat type: {message.chat.type}\n"
         f"- bot active: {active}\n"
         f"- mention only: {mention_only}\n"
+        f"- tool clues: {show_tool_notes}\n"
         f"- model: {config.MODEL_NAME}\n"
         f"- uptime: {uptime}\n"
         f"- ram: {ram}"
@@ -687,6 +705,7 @@ async def handle_chat_message(message: Message, bot: Bot):
     # Whether this sender may drive state-changing tools (persona/skill edits,
     # group moderation). Checked once here and passed into the agent.
     privileged = await is_user_privileged(message, bot)
+    show_tool_notes = await cache.get_chat_tool_notes(chat_id)
 
     history = await cache.get_chat_history(chat_id)
     user_msg_entry = {"role": "user", "content": cleaned_text}
@@ -704,6 +723,7 @@ async def handle_chat_message(message: Message, bot: Bot):
                 bot_instance=bot,
                 chat_id=chat_id,
                 requester_is_privileged=privileged,
+                show_tool_notes=show_tool_notes,
             )
 
         if config.FORCE_LOWERCASE:

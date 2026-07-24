@@ -33,6 +33,10 @@ LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2"))
 # and capitalizing can't break character. URLs and code spans are preserved.
 FORCE_LOWERCASE = os.getenv("FORCE_LOWERCASE", "true").strip().lower() in ("1", "true", "yes", "on")
 
+# Default for whether the bot posts the "🔍 searching..." tool-activity notes in
+# a chat. This is the per-chat default; each chat can override it with /toggle_tools.
+SHOW_TOOL_NOTES_DEFAULT = os.getenv("SHOW_TOOL_NOTES", "true").strip().lower() in ("1", "true", "yes", "on")
+
 # Database configurations
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 

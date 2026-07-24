@@ -13,6 +13,9 @@ _settings_cache: Dict[int, bool] = {}
 # Maps chat_id (int) -> is_active (bool)
 _active_cache: Dict[int, bool] = {}
 
+# Maps chat_id (int) -> show_tool_notes (bool)
+_tool_notes_cache: Dict[int, bool] = {}
+
 # Maps chat_id (int) -> deque of messages (role/content dicts)
 _history_cache: Dict[int, deque] = {}
 HISTORY_MAXLEN = 20
@@ -51,9 +54,11 @@ async def get_chat_setting(chat_id: int) -> bool:
         # every message @-mentioned it.
         mention_only = settings.get("mention_only", False)
         _settings_cache[chat_id] = mention_only
-        # Also cache is_active since we fetched it
+        # Also cache is_active / show_tool_notes since we fetched the row
         if "is_active" in settings:
             _active_cache[chat_id] = settings["is_active"]
+        if "show_tool_notes" in settings:
+            _tool_notes_cache[chat_id] = settings["show_tool_notes"]
         return mention_only
     except Exception as e:
         logger.error(f"Error fetching settings for chat {chat_id} from DB, using default (False): {e}")
@@ -80,9 +85,11 @@ async def get_chat_active(chat_id: int) -> bool:
         settings = await db.fetch_chat_settings(chat_id)
         is_active = settings.get("is_active", False)
         _active_cache[chat_id] = is_active
-        # Also cache mention_only since we fetched it
+        # Also cache mention_only / show_tool_notes since we fetched the row
         if "mention_only" in settings:
             _settings_cache[chat_id] = settings["mention_only"]
+        if "show_tool_notes" in settings:
+            _tool_notes_cache[chat_id] = settings["show_tool_notes"]
         return is_active
     except Exception as e:
         logger.error(f"Error fetching active status for chat {chat_id} from DB, using default (False): {e}")
@@ -93,9 +100,33 @@ def set_chat_active(chat_id: int, is_active: bool) -> None:
     Updates the active status in the cache and triggers an async background DB write.
     """
     _active_cache[chat_id] = is_active
-    
+
     # Run DB write in background
     _spawn_db_write(db.update_chat_active(chat_id, is_active))
+
+async def get_chat_tool_notes(chat_id: int) -> bool:
+    """Returns whether tool-activity notes should be shown in this chat."""
+    if chat_id in _tool_notes_cache:
+        return _tool_notes_cache[chat_id]
+
+    import config
+    try:
+        settings = await db.fetch_chat_settings(chat_id)
+        show = settings.get("show_tool_notes", config.SHOW_TOOL_NOTES_DEFAULT)
+        _tool_notes_cache[chat_id] = show
+        if "mention_only" in settings:
+            _settings_cache[chat_id] = settings["mention_only"]
+        if "is_active" in settings:
+            _active_cache[chat_id] = settings["is_active"]
+        return show
+    except Exception as e:
+        logger.error(f"Error fetching tool-notes setting for chat {chat_id}: {e}")
+        return config.SHOW_TOOL_NOTES_DEFAULT
+
+def set_chat_tool_notes(chat_id: int, show_tool_notes: bool) -> None:
+    """Updates the tool-notes setting in cache and triggers a background DB write."""
+    _tool_notes_cache[chat_id] = show_tool_notes
+    _spawn_db_write(db.update_chat_tool_notes(chat_id, show_tool_notes))
 
 async def get_chat_history(chat_id: int) -> List[Dict[str, str]]:
     """

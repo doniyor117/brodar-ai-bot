@@ -338,6 +338,7 @@ async def generate_response(
     bot_instance: Optional[Any] = None,
     chat_id: Optional[int] = None,
     requester_is_privileged: bool = False,
+    show_tool_notes: bool = True,
 ) -> str:
     """
     Generates a response from the AI Agent bot.
@@ -429,7 +430,8 @@ async def generate_response(
                 args = {}
 
             # Tell the user what's happening so tool use isn't a silent black box.
-            await _notify(bot_instance, chat_id, _tool_status_line(tool_name, args))
+            if show_tool_notes:
+                await _notify(bot_instance, chat_id, _tool_status_line(tool_name, args))
 
             # Central authorization gate for state-mutating tools.
             if tool_name in _PRIVILEGED_TOOLS and not requester_is_privileged:

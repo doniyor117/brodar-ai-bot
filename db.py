@@ -18,9 +18,12 @@ SCHEMA_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS chats (
         chat_id BIGINT PRIMARY KEY,
         mention_only BOOLEAN DEFAULT FALSE NOT NULL,
-        is_active BOOLEAN DEFAULT FALSE NOT NULL
+        is_active BOOLEAN DEFAULT FALSE NOT NULL,
+        show_tool_notes BOOLEAN DEFAULT TRUE NOT NULL
     )
     """,
+    # Migration for chats tables created before show_tool_notes existed.
+    "ALTER TABLE chats ADD COLUMN IF NOT EXISTS show_tool_notes BOOLEAN DEFAULT TRUE NOT NULL",
     """
     CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -140,7 +143,7 @@ async def fetch_chat_settings(chat_id: int) -> Dict[str, Any]:
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT chat_id, mention_only, is_active FROM chats WHERE chat_id = $1",
+            "SELECT chat_id, mention_only, is_active, show_tool_notes FROM chats WHERE chat_id = $1",
             chat_id
         )
         if row:
@@ -150,17 +153,17 @@ async def fetch_chat_settings(chat_id: int) -> Dict[str, Any]:
         try:
             row = await conn.fetchrow(
                 """
-                INSERT INTO chats (chat_id, mention_only, is_active)
-                VALUES ($1, FALSE, FALSE)
+                INSERT INTO chats (chat_id, mention_only, is_active, show_tool_notes)
+                VALUES ($1, FALSE, FALSE, TRUE)
                 ON CONFLICT (chat_id) DO UPDATE SET chat_id = EXCLUDED.chat_id
-                RETURNING chat_id, mention_only, is_active
+                RETURNING chat_id, mention_only, is_active, show_tool_notes
                 """,
                 chat_id
             )
             return dict(row)
         except Exception as e:
             logger.error(f"Error creating default chat settings for {chat_id}: {e}")
-            return {"chat_id": chat_id, "mention_only": False, "is_active": False}
+            return {"chat_id": chat_id, "mention_only": False, "is_active": False, "show_tool_notes": True}
 
 async def update_chat_settings(chat_id: int, mention_only: bool) -> None:
     """Updates the mention_only setting for a specific chat."""
@@ -188,6 +191,21 @@ async def update_chat_active(chat_id: int, is_active: bool) -> None:
             DO UPDATE SET is_active = EXCLUDED.is_active
             """,
             chat_id, is_active
+        )
+
+
+async def update_chat_tool_notes(chat_id: int, show_tool_notes: bool) -> None:
+    """Updates whether tool-activity notes are shown for a specific chat."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO chats (chat_id, show_tool_notes)
+            VALUES ($1, $2)
+            ON CONFLICT (chat_id)
+            DO UPDATE SET show_tool_notes = EXCLUDED.show_tool_notes
+            """,
+            chat_id, show_tool_notes
         )
 
 
