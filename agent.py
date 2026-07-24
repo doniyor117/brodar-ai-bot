@@ -472,6 +472,11 @@ async def generate_response(
             else:
                 tool_result = f"Error: Unknown tool '{tool_name}'."
 
+            # Observability: log every tool result (truncated) so misbehaving
+            # tool calls in production are diagnosable instead of invisible.
+            result_preview = (tool_result or "")[:200].replace("\n", " ")
+            logger.info(f"[chat {chat_id}] tool '{tool_name}' -> {result_preview}")
+
             full_messages.append({
                 "role": "tool",
                 "tool_call_id": tool_id,
@@ -479,6 +484,7 @@ async def generate_response(
                 "content": tool_result
             })
 
+    logger.warning(f"[chat {chat_id}] hit max tool loops ({max_tool_loops}) without a final answer.")
     return "too many operations. my head hurts. let me rest."
 
 

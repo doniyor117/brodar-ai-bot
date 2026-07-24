@@ -29,6 +29,10 @@ MODEL_NAME = os.getenv("MODEL_NAME", "glm-4.7-flash")
 # concurrency limited, but 1 means a single slow chat blocks every other chat.
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2"))
 
+# Hard-enforce brodar's all-lowercase style in code, so a flash model slipping
+# and capitalizing can't break character. URLs and code spans are preserved.
+FORCE_LOWERCASE = os.getenv("FORCE_LOWERCASE", "true").strip().lower() in ("1", "true", "yes", "on")
+
 # Database configurations
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 

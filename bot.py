@@ -126,6 +126,21 @@ class ShouldRespondFilter(BaseFilter):
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096
 
+# Spans we must NOT lowercase: fenced code, inline code, and URLs. Everything
+# else in a conversational reply gets forced to lowercase to keep brodar in
+# character even when the flash model slips.
+import re as _re
+_PROTECTED_SPAN_RE = _re.compile(r"(```.*?```|`[^`]*`|https?://\S+|www\.\S+)", _re.DOTALL)
+
+
+def enforce_lowercase(text: str) -> str:
+    """Lowercases conversational text while preserving URLs and code spans."""
+    if not text:
+        return text
+    parts = _PROTECTED_SPAN_RE.split(text)
+    # re.split with a capture group yields [plain, protected, plain, ...].
+    return "".join(p if i % 2 else p.lower() for i, p in enumerate(parts))
+
 
 async def send_long_reply(message: Message, text: str) -> None:
     """
@@ -690,6 +705,9 @@ async def handle_chat_message(message: Message, bot: Bot):
                 chat_id=chat_id,
                 requester_is_privileged=privileged,
             )
+
+        if config.FORCE_LOWERCASE:
+            bot_reply = enforce_lowercase(bot_reply)
 
         # Persist BEFORE sending. If sending fails (e.g. formatting), the turn is
         # still saved to history instead of being silently lost.
