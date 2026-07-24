@@ -303,6 +303,36 @@ _PRIVILEGED_TOOLS = {
 }
 
 
+def _tool_status_line(tool_name: str, args: Dict[str, Any]) -> str:
+    """A short, in-character, user-facing note about what tool is running."""
+    if tool_name == "search_web":
+        q = (args.get("query") or "").strip()
+        return f'🔍 searching the web{f" for “{q}”" if q else ""}...'
+    if tool_name == "execute_shell_command":
+        cmd = (args.get("command") or "").strip()
+        a = (args.get("args_str") or "").strip()
+        return f"⚙️ running `{cmd} {a}`".rstrip() + "..."
+    if tool_name == "use_skill":
+        return f'📄 loading skill: {args.get("skill_name", "")}...'
+    if tool_name in ("save_memory_fact", "edit_memory_file"):
+        return "🧠 updating my memory..."
+    if tool_name == "manage_skill_file":
+        return "🛠️ writing a skill file..."
+    if tool_name == "group_moderation_tool":
+        return f'👮 group action: {args.get("action", "")}...'
+    return f"🔧 using {tool_name}..."
+
+
+async def _notify(bot_instance: Optional[Any], chat_id: Optional[int], text: str) -> None:
+    """Best-effort status ping to the chat so tool use isn't a black box."""
+    if not bot_instance or not chat_id:
+        return
+    try:
+        await bot_instance.send_message(chat_id, text)
+    except Exception as e:
+        logger.warning(f"Failed to send tool-status note to chat {chat_id}: {e}")
+
+
 async def generate_response(
     chat_history: List[Dict[str, str]],
     bot_instance: Optional[Any] = None,
@@ -348,7 +378,7 @@ async def generate_response(
     full_messages.extend(FEW_SHOTS)
     full_messages.extend(chat_history)
 
-    max_tool_loops = 5
+    max_tool_loops = 6
 
     for loop_idx in range(max_tool_loops):
         response = await _call_llm_with_retry(full_messages, tools=TOOLS_SCHEMA)
@@ -397,6 +427,9 @@ async def generate_response(
             except Exception as e:
                 logger.error(f"Failed to parse tool arguments for {tool_name}: {e}")
                 args = {}
+
+            # Tell the user what's happening so tool use isn't a silent black box.
+            await _notify(bot_instance, chat_id, _tool_status_line(tool_name, args))
 
             # Central authorization gate for state-mutating tools.
             if tool_name in _PRIVILEGED_TOOLS and not requester_is_privileged:
@@ -484,8 +517,26 @@ async def generate_response(
                 "content": tool_result
             })
 
-    logger.warning(f"[chat {chat_id}] hit max tool loops ({max_tool_loops}) without a final answer.")
-    return "too many operations. my head hurts. let me rest."
+    # Ran out of tool loops without a plain-text answer. Instead of dead-ending
+    # with a useless message, force one final reply with tools DISABLED so the
+    # model has to actually respond with what it's gathered so far.
+    logger.warning(f"[chat {chat_id}] hit max tool loops ({max_tool_loops}); forcing a final answer.")
+    try:
+        full_messages.append({
+            "role": "system",
+            "content": "stop calling tools now. reply to the user directly in your normal "
+                       "casual lowercase voice using whatever you've already found. if you "
+                       "couldn't get what they wanted, just say so briefly.",
+        })
+        final = await _call_llm_with_retry(full_messages, tools=None)
+        if final and final.choices:
+            content = final.choices[0].message.content
+            if content:
+                return content
+    except Exception as e:
+        logger.error(f"[chat {chat_id}] forced-final-answer call failed: {e}")
+
+    return "ok that spiraled a bit. tell me exactly what you want and i'll get it in one shot."
 
 
 def _write_skill_file(sk_name: str, sk_content: str) -> str:
