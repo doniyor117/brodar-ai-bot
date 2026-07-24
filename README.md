@@ -39,10 +39,11 @@ brodar-ai-bot/
 ---
 
 ## 2. Neon Postgres Database Setup & Schema
-To keep the bot lightweight and efficient, we use **raw SQL migrations** via the Neon console or any SQL editor.
+The full schema (all tables **and** indexes) is created automatically on startup
+by `db.init_schema()` — you do **not** need to run any SQL by hand. Just point
+`DATABASE_URL` at your Neon database and start the app.
 
-### Migration SQL
-Log in to your [Neon Console](https://console.neon.tech/), select your database, open the **SQL Editor**, and run the following statements:
+The SQL below is provided for reference / manual inspection only:
 
 ```sql
 -- 1. Create the Chats table to persist reply preferences and activation state

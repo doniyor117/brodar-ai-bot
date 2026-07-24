@@ -17,12 +17,24 @@ _active_cache: Dict[int, bool] = {}
 _history_cache: Dict[int, deque] = {}
 HISTORY_MAXLEN = 20
 
+# Strong references to background DB-write tasks. Without this the event loop
+# only weakly references them and the GC can cancel a write before it lands.
+_write_tasks: set = set()
+
+def _spawn_db_write(coro) -> None:
+    """Fire-and-forget a DB write, keeping a strong reference and logging failures."""
+    task = asyncio.create_task(coro)
+    _write_tasks.add(task)
+    task.add_done_callback(_write_tasks.discard)
+    task.add_done_callback(_handle_db_write_error)
+
 def _handle_db_write_error(task: asyncio.Task):
     """Callback to log exceptions from background DB writes."""
-    try:
-        task.result()
-    except Exception as e:
-        logger.error(f"Background database write failed: {e}", exc_info=True)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(f"Background database write failed: {exc}", exc_info=exc)
 
 async def get_chat_setting(chat_id: int) -> bool:
     """
@@ -34,15 +46,18 @@ async def get_chat_setting(chat_id: int) -> bool:
 
     try:
         settings = await db.fetch_chat_settings(chat_id)
-        mention_only = settings.get("mention_only", True)
+        # Default False: once a group is /activate-d it replies to everything.
+        # Defaulting to mention-only made an activated bot look dead unless
+        # every message @-mentioned it.
+        mention_only = settings.get("mention_only", False)
         _settings_cache[chat_id] = mention_only
         # Also cache is_active since we fetched it
         if "is_active" in settings:
             _active_cache[chat_id] = settings["is_active"]
         return mention_only
     except Exception as e:
-        logger.error(f"Error fetching settings for chat {chat_id} from DB, using default (True): {e}")
-        return True
+        logger.error(f"Error fetching settings for chat {chat_id} from DB, using default (False): {e}")
+        return False
 
 def set_chat_setting(chat_id: int, mention_only: bool) -> None:
     """
@@ -51,8 +66,7 @@ def set_chat_setting(chat_id: int, mention_only: bool) -> None:
     _settings_cache[chat_id] = mention_only
     
     # Run DB write in background
-    task = asyncio.create_task(db.update_chat_settings(chat_id, mention_only))
-    task.add_done_callback(_handle_db_write_error)
+    _spawn_db_write(db.update_chat_settings(chat_id, mention_only))
 
 async def get_chat_active(chat_id: int) -> bool:
     """
@@ -81,8 +95,7 @@ def set_chat_active(chat_id: int, is_active: bool) -> None:
     _active_cache[chat_id] = is_active
     
     # Run DB write in background
-    task = asyncio.create_task(db.update_chat_active(chat_id, is_active))
-    task.add_done_callback(_handle_db_write_error)
+    _spawn_db_write(db.update_chat_active(chat_id, is_active))
 
 async def get_chat_history(chat_id: int) -> List[Dict[str, str]]:
     """
@@ -124,16 +137,17 @@ def save_messages_async(chat_id: int, messages: List[Dict[str, str]]) -> None:
         add_message_to_cache(chat_id, msg["role"], msg["content"])
     
     # 2. Trigger Async DB Write
-    task = asyncio.create_task(db.save_messages_batch(chat_id, messages))
-    task.add_done_callback(_handle_db_write_error)
+    _spawn_db_write(db.save_messages_batch(chat_id, messages))
 
 async def clear_chat_history(chat_id: int) -> None:
     """Clears conversation history from in-memory cache and triggers background DB deletion."""
     if chat_id in _history_cache:
         _history_cache[chat_id].clear()
 
-    task = asyncio.create_task(db.clear_chat_history(chat_id))
-    task.add_done_callback(_handle_db_write_error)
+    _spawn_db_write(db.clear_chat_history(chat_id))
+    # Also drop summary checkpoints, otherwise "cleared" context keeps getting
+    # re-injected into the system prompt from the last compaction.
+    _spawn_db_write(db.clear_session_summaries(chat_id))
 
 # Set of allowed user IDs (combining env config and DB)
 _allowed_users_cache: Optional[set] = None
@@ -164,8 +178,7 @@ def add_allowed_user(user_id: int) -> None:
     else:
         _allowed_users_cache = set(config.ALLOWED_DM_USER_IDS) | {user_id}
 
-    task = asyncio.create_task(db.add_allowed_user(user_id))
-    task.add_done_callback(_handle_db_write_error)
+    _spawn_db_write(db.add_allowed_user(user_id))
 
 def remove_allowed_user(user_id: int) -> None:
     """Removes a user ID from the allowed cache and triggers DB deletion."""
@@ -173,6 +186,5 @@ def remove_allowed_user(user_id: int) -> None:
     if _allowed_users_cache is not None:
         _allowed_users_cache.discard(user_id)
 
-    task = asyncio.create_task(db.remove_allowed_user(user_id))
-    task.add_done_callback(_handle_db_write_error)
+    _spawn_db_write(db.remove_allowed_user(user_id))
 

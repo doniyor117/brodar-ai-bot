@@ -124,6 +124,43 @@ class ShouldRespondFilter(BaseFilter):
 
         return False
 
+TELEGRAM_MAX_MESSAGE_LEN = 4096
+
+
+async def send_long_reply(message: Message, text: str) -> None:
+    """
+    Replies to a message, splitting anything over Telegram's 4096-char hard limit
+    into multiple chunks. A single over-long reply used to raise TelegramBadRequest
+    and the user just saw the generic error message instead.
+    """
+    if not text:
+        text = "..."
+    # First chunk is a reply; the rest are follow-up sends to keep ordering.
+    chunks = [text[i:i + TELEGRAM_MAX_MESSAGE_LEN] for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LEN)]
+    first = True
+    for chunk in chunks:
+        if first:
+            await message.reply(chunk)
+            first = False
+        else:
+            await message.answer(chunk)
+
+
+async def is_user_privileged(message: Message, bot: Bot) -> bool:
+    """
+    True if the sender may run state-changing commands / tools:
+    DM-allowlisted users anywhere, or group administrators in their group.
+    """
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id:
+        return False
+    if await cache.is_user_allowed(user_id):
+        return True
+    if message.chat.type != "private":
+        return await is_sender_admin(message, bot)
+    return False
+
+
 async def is_sender_admin(message: Message, bot: Bot, user_id: int = None) -> bool:
     """Checks if the user who sent the command is an administrator in the chat."""
     if message.chat.type == "private":
@@ -236,8 +273,9 @@ async def cmd_status(message: Message):
     mention_only = await cache.get_chat_setting(chat_id) if message.chat.type != "private" else False
     
     import tools
-    uptime = tools.execute_shell_command("uptime", "").strip()
-    ram = tools.execute_shell_command("free", "-h").strip()
+    # Run blocking subprocess calls off the event loop.
+    uptime = (await asyncio.to_thread(tools.execute_shell_command, "uptime", "")).strip()
+    ram = (await asyncio.to_thread(tools.execute_shell_command, "free", "-h")).strip()
     
     text = (
         f"brodar status report:\n"
@@ -251,8 +289,11 @@ async def cmd_status(message: Message):
     await message.reply(text)
 
 @router.message(Command("clear"))
-async def cmd_clear(message: Message):
+async def cmd_clear(message: Message, bot: Bot):
     """Clears conversation history for the chat."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can clear the chat context.")
+        return
     chat_id = message.chat.id
     await cache.clear_chat_history(chat_id)
     await message.reply("cleared conversation context for this chat. fresh start.")
@@ -273,8 +314,11 @@ async def cmd_skills(message: Message):
     await message.reply("\n".join(lines))
 
 @router.message(Command("memory"))
-async def cmd_memory(message: Message):
-    """Displays the stored MEMORY.md file contents."""
+async def cmd_memory(message: Message, bot: Bot):
+    """Displays the stored MEMORY.md file contents. Admin-only (contains admin IDs)."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("that's private. only authorized admins can view memory.")
+        return
     import memory
     mem_content = memory.read_memory_md()
     if not mem_content.strip():
@@ -295,8 +339,11 @@ async def cmd_stop(message: Message):
 
 @router.message(Command("new_session"))
 @router.message(Command("new"))
-async def cmd_new_session(message: Message):
+async def cmd_new_session(message: Message, bot: Bot):
     """Starts a new named conversation session."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can start a new session.")
+        return
     chat_id = message.chat.id
     parts = (message.text or "").strip().split(maxsplit=1)
     title = parts[1] if len(parts) > 1 else "new session"
@@ -321,8 +368,11 @@ async def cmd_sessions(message: Message):
     await message.reply("\n".join(lines))
 
 @router.message(Command("switch_session"))
-async def cmd_switch_session(message: Message):
+async def cmd_switch_session(message: Message, bot: Bot):
     """Switches the active session for the chat."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can switch sessions.")
+        return
     chat_id = message.chat.id
     parts = (message.text or "").strip().split()
     if len(parts) < 2 or not parts[1].isdigit():
@@ -338,8 +388,11 @@ async def cmd_switch_session(message: Message):
 
 @router.message(Command("compress"))
 @router.message(Command("compact"))
-async def cmd_compress(message: Message):
+async def cmd_compress(message: Message, bot: Bot):
     """Manually triggers LLM context compaction."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can compact context.")
+        return
     chat_id = message.chat.id
     await message.reply("compacting conversation history into context checkpoint...")
     import session_manager
@@ -347,8 +400,11 @@ async def cmd_compress(message: Message):
     await message.reply(result)
 
 @router.message(Command("install_skill"))
-async def cmd_install_skill(message: Message):
-    """Installs an external SKILL.md from a URL."""
+async def cmd_install_skill(message: Message, bot: Bot):
+    """Installs an external SKILL.md from a URL. Admin-only (writes into the prompt)."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can install skills.")
+        return
     parts = (message.text or "").strip().split(maxsplit=2)
     if len(parts) < 2:
         await message.reply("usage: /install_skill <url> [optional_name]")
@@ -356,12 +412,16 @@ async def cmd_install_skill(message: Message):
     url = parts[1]
     name = parts[2] if len(parts) > 2 else None
     import skills
-    result = skills.install_skill_from_url(url, name)
+    # Blocking network download — keep it off the event loop.
+    result = await asyncio.to_thread(skills.install_skill_from_url, url, name)
     await message.reply(result)
 
 @router.message(Command("enable_skill"))
-async def cmd_enable_skill(message: Message):
+async def cmd_enable_skill(message: Message, bot: Bot):
     """Enables a skill."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can toggle skills.")
+        return
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
         await message.reply("usage: /enable_skill <skill_name>")
@@ -372,8 +432,11 @@ async def cmd_enable_skill(message: Message):
     await message.reply(f"skill '{skill_name}' enabled.")
 
 @router.message(Command("disable_skill"))
-async def cmd_disable_skill(message: Message):
+async def cmd_disable_skill(message: Message, bot: Bot):
     """Disables a skill."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can toggle skills.")
+        return
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
         await message.reply("usage: /disable_skill <skill_name>")
@@ -384,8 +447,11 @@ async def cmd_disable_skill(message: Message):
     await message.reply(f"skill '{skill_name}' disabled.")
 
 @router.message(Command("uninstall_skill"))
-async def cmd_uninstall_skill(message: Message):
+async def cmd_uninstall_skill(message: Message, bot: Bot):
     """Uninstalls a skill."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can uninstall skills.")
+        return
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
         await message.reply("usage: /uninstall_skill <skill_name>")
@@ -522,13 +588,23 @@ async def cmd_demote(message: Message, bot: Bot):
 @router.callback_query(permissions.PermCallback.filter())
 async def handle_permission_callback(callback: CallbackQuery, callback_data: permissions.PermCallback, bot: Bot):
     """Handles inline keyboard responses for permission approval prompts."""
+    # callback.message can be None for very old messages.
+    if not callback.message:
+        await callback.answer("This request is no longer available.", show_alert=True)
+        return
+
     chat = callback.message.chat
     user = callback.from_user
 
-    # Verify group admin rights for group chats
+    # Access control: callback queries bypass the message middleware, so enforce
+    # here. Group -> must be a group admin. DM -> must be DM-allowlisted.
     if chat.type != "private":
         if not await is_sender_admin(callback.message, bot, user_id=user.id):
             await callback.answer("Only group admins can approve or reject permission requests!", show_alert=True)
+            return
+    else:
+        if not await cache.is_user_allowed(user.id):
+            await callback.answer("You are not authorized.", show_alert=True)
             return
 
     req_id = callback_data.req_id
@@ -580,14 +656,12 @@ async def handle_chat_message(message: Message, bot: Bot):
     Registers task in agent._running_tasks to support emergency /stop cancellation.
     """
     chat_id = message.chat.id
-    user_id = message.from_user.id if message.from_user else 0
-    username = message.from_user.username if message.from_user else "user"
     raw_text = message.text or message.caption or ""
 
     global BOT_USERNAME
     if not BOT_USERNAME:
         await init_bot_info(bot)
-        
+
     cleaned_text = raw_text
     if BOT_USERNAME:
         cleaned_text = raw_text.replace(f"@{BOT_USERNAME}", "").strip()
@@ -595,24 +669,36 @@ async def handle_chat_message(message: Message, bot: Bot):
     if not cleaned_text:
         return
 
+    # Whether this sender may drive state-changing tools (persona/skill edits,
+    # group moderation). Checked once here and passed into the agent.
+    privileged = await is_user_privileged(message, bot)
+
     history = await cache.get_chat_history(chat_id)
     user_msg_entry = {"role": "user", "content": cleaned_text}
     temp_history = history + [user_msg_entry]
 
-    try:
-        current_task = asyncio.current_task()
-        if current_task:
-            agent.register_running_task(chat_id, current_task)
+    current_task = asyncio.current_task()
+    if current_task:
+        agent.register_running_task(chat_id, current_task)
 
+    try:
         async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
             logger.info(f"Generating agent response for chat {chat_id}...")
-            bot_reply = await agent.generate_response(temp_history, bot_instance=bot, chat_id=chat_id)
-        
-        sent_message = await message.reply(bot_reply)
+            bot_reply = await agent.generate_response(
+                temp_history,
+                bot_instance=bot,
+                chat_id=chat_id,
+                requester_is_privileged=privileged,
+            )
 
-        cache_user_msg = {"role": "user", "content": cleaned_text}
-        cache_bot_msg = {"role": "assistant", "content": bot_reply}
-        cache.save_messages_async(chat_id, [cache_user_msg, cache_bot_msg])
+        # Persist BEFORE sending. If sending fails (e.g. formatting), the turn is
+        # still saved to history instead of being silently lost.
+        cache.save_messages_async(chat_id, [
+            {"role": "user", "content": cleaned_text},
+            {"role": "assistant", "content": bot_reply},
+        ])
+
+        await send_long_reply(message, bot_reply)
 
     except asyncio.CancelledError:
         logger.info(f"Task execution for chat {chat_id} was cancelled by emergency stop.")
@@ -624,4 +710,4 @@ async def handle_chat_message(message: Message, bot: Bot):
         except Exception as send_err:
             logger.error(f"Failed to send error message: {send_err}")
     finally:
-        agent.unregister_running_task(chat_id)
+        agent.unregister_running_task(chat_id, current_task)

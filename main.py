@@ -1,10 +1,13 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Set
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Header, HTTPException, status
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Update
 
 import config
@@ -18,19 +21,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Validate that required configuration is present
+# Fails loudly (SystemExit) if credentials are missing or still placeholders.
 config.validate_config()
 
-# Initialize Bot and Dispatcher
-# Using HTML parse mode for nice message formatting if needed
-bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
+# Initialize Bot and Dispatcher.
+# parse_mode is deliberately None: model output is arbitrary text and would
+# routinely break HTML/Markdown parsing. Messages that need formatting pass
+# parse_mode explicitly (see permissions.py).
+bot = Bot(
+    token=config.TELEGRAM_BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=None),
+)
 dp = Dispatcher()
 
 # Register bot handlers router
 dp.include_router(bot_module.router)
 
-import asyncio
-import httpx
+# Strong references to in-flight background tasks. asyncio only holds a weak
+# reference to a running task, so without this the garbage collector can
+# cancel update processing mid-flight and messages vanish at random.
+_background_tasks: Set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    """Creates a background task and keeps a strong reference until it finishes."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 async def _keep_alive_loop():
     """
@@ -38,7 +57,7 @@ async def _keep_alive_loop():
     every 10 minutes (600 seconds) via HTTP request through Render's edge proxy
     to prevent the container from spinning down on Render free tier.
     """
-    if not config.WEBHOOK_URL or "CHANGE_ME" in config.WEBHOOK_URL:
+    if not config.webhook_url_is_usable():
         logger.info("WEBHOOK_URL is not configured with a valid domain. Self keep-alive loop disabled.")
         return
 
@@ -63,41 +82,57 @@ async def lifespan(app: FastAPI):
     """FastAPI Lifespan event manager handling startup and shutdown."""
     # 1. Startup Logic
     logger.info("Starting up Telegram AI Bot Service...")
-    
-    # Initialize the Database connection pool
+
+    # Initialize the Database connection pool and create the schema.
+    # A failure here is fatal: without the DB, group activation and history
+    # live only in process memory and are lost on every restart.
     if config.DATABASE_URL:
         try:
             await db.init_db_pool()
             import memory
             await memory.sync_memory_from_db()
         except Exception as e:
-            logger.error(f"Failed to initialize database pool during startup: {e}")
+            logger.critical(
+                f"Failed to initialize the database during startup: {e}. "
+                "Chat settings and history CANNOT persist. Fix DATABASE_URL and redeploy.",
+                exc_info=True,
+            )
+            raise
     else:
         logger.warning("DATABASE_URL is not set. Database operations will be bypassed.")
-
 
     # Initialize bot details (caches bot username)
     await bot_module.init_bot_info(bot)
 
     # Set up Telegram webhook
-    if config.WEBHOOK_URL:
-        webhook_endpoint = f"{config.WEBHOOK_URL}/webhook"
+    if config.webhook_url_is_usable():
+        webhook_endpoint = f"{config.WEBHOOK_URL.rstrip('/')}/webhook"
         logger.info(f"Setting Telegram webhook to: {webhook_endpoint}")
         try:
             await bot.set_webhook(
                 url=webhook_endpoint,
                 secret_token=config.WEBHOOK_SECRET_TOKEN,
-                drop_pending_updates=True,
+                # Keep updates that arrived while the container was spun down
+                # (Render free tier sleeps constantly) instead of discarding them.
+                drop_pending_updates=False,
                 allowed_updates=dp.resolve_used_update_types()
             )
-            logger.info("Telegram webhook set successfully.")
+            info = await bot.get_webhook_info()
+            logger.info(f"Telegram webhook set successfully. Pending updates: {info.pending_update_count}")
+            if info.last_error_message:
+                logger.warning(f"Telegram reports a previous webhook error: {info.last_error_message}")
         except Exception as e:
-            logger.error(f"Failed to set Telegram webhook: {e}")
+            # Without a webhook the bot receives nothing at all — never degrade silently.
+            logger.critical(f"Failed to set Telegram webhook: {e}", exc_info=True)
+            raise
     else:
-        logger.warning("WEBHOOK_URL is not set. Webhook registration skipped.")
+        logger.critical(
+            f"WEBHOOK_URL is unusable (value: {config.WEBHOOK_URL or '<unset>'}). "
+            "Telegram will NOT deliver any updates. Set it to your deployed https base URL."
+        )
 
     # Launch background keep-alive ping loop
-    keep_alive_task = asyncio.create_task(_keep_alive_loop())
+    keep_alive_task = _spawn_background(_keep_alive_loop())
 
     try:
         yield # Running app
@@ -105,6 +140,12 @@ async def lifespan(app: FastAPI):
         # 2. Shutdown Logic
         logger.info("Shutting down Telegram AI Bot Service...")
         keep_alive_task.cancel()
+
+        # Let in-flight updates finish before tearing down the bot session.
+        pending = [t for t in _background_tasks if t is not keep_alive_task and not t.done()]
+        if pending:
+            logger.info(f"Waiting for {len(pending)} in-flight update(s) to finish...")
+            await asyncio.wait(pending, timeout=10.0)
 
         # Remove Telegram Webhook
         try:
@@ -163,13 +204,13 @@ async def telegram_webhook(
     try:
         update_json = await request.json()
         update = Update.model_validate(update_json, context={"bot": bot})
-        
+
         # Process update in a background task — return 200 to Telegram IMMEDIATELY.
         # This is critical: if we `await` dp.feed_update here, LLM generation
         # blocks the webhook response for 5-30s. Telegram's webhook timeout
         # triggers retries, and eventually Telegram stops sending updates entirely.
-        asyncio.create_task(_safe_process_update(update))
-        
+        _spawn_background(_safe_process_update(update))
+
         return {"ok": True}
     except Exception as e:
         logger.error(f"Error processing webhook update: {e}", exc_info=True)
@@ -179,6 +220,8 @@ async def _safe_process_update(update: Update):
     """Process a Telegram update in the background with full error handling."""
     try:
         await dp.feed_update(bot, update)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"Error in background update processing: {e}", exc_info=True)
 

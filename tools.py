@@ -6,6 +6,8 @@ import subprocess
 import logging
 from typing import List, Dict, Any
 
+import config
+
 logger = logging.getLogger(__name__)
 
 # Fallback-safe import for ddgs
@@ -74,39 +76,80 @@ ALLOWED_COMMANDS = {
     "ls": {
         "bin": "ls",
         "args_regex": r"^$|^-[la1h]+(\s+[a-zA-Z0-9_./-]+)?$",
-        "description": "Lists directory contents."
+        "description": "Lists directory contents.",
+        "has_path_args": True,
     },
     "cat": {
         "bin": "cat",
         "args_regex": r"^[a-zA-Z0-9_./-]+$",
-        "description": "Displays file content."
+        "description": "Displays file content.",
+        "has_path_args": True,
     },
     "head": {
         "bin": "head",
         "args_regex": r"^$|^(-n\s+[0-9]+\s+)?[a-zA-Z0-9_./-]+$",
-        "description": "Displays top lines of a file."
+        "description": "Displays top lines of a file.",
+        "has_path_args": True,
     },
     "tail": {
         "bin": "tail",
         "args_regex": r"^$|^(-n\s+[0-9]+\s+)?[a-zA-Z0-9_./-]+$",
-        "description": "Displays end lines of a file."
+        "description": "Displays end lines of a file.",
+        "has_path_args": True,
     },
     "grep": {
         "bin": "grep",
         "args_regex": r"^-[irn]+\s+['\"][a-zA-Z0-9_.-]+['\"]\s+[a-zA-Z0-9_./-]+$|^[a-zA-Z0-9_.-]+\s+[a-zA-Z0-9_./-]+$",
-        "description": "Searches pattern in file."
+        "description": "Searches pattern in file.",
+        "has_path_args": True,
     },
     "find": {
         "bin": "find",
         "args_regex": r"^\.\s+-name\s+['\"][a-zA-Z0-9_*.-]+['\"]$",
-        "description": "Finds files by name."
+        "description": "Finds files by name.",
+        "has_path_args": True,
     }
 }
 
+
+def _workspace_dir() -> str:
+    """Returns (and lazily creates) the sandbox directory shell tools run inside."""
+    d = config.TOOL_WORKSPACE_DIR
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Failed to create tool workspace dir {d}: {e}")
+    return d
+
+
 def is_env_access_attempt(command: str, args_str: str) -> bool:
-    """Checks if a command or arguments attempt to read or access .env files."""
+    """
+    Kept for backwards compatibility. The real protection is the workspace
+    sandbox in execute_shell_command; this is now just a fast obvious-case check.
+    """
     text = f"{command} {args_str}".lower()
     return ".env" in text or "env." in text or "/env" in text
+
+
+def _path_args_are_safe(args_list: List[str], workspace: str) -> bool:
+    """
+    Ensures every filesystem-path argument resolves to a location *inside* the
+    workspace sandbox. This is what stops `grep -ri API .`, `cat ../.env`,
+    absolute paths, and symlink tricks from ever reaching the secrets on disk.
+    """
+    real_workspace = os.path.realpath(workspace)
+    for arg in args_list:
+        # Skip flags and grep/find operators — only inspect things that look like paths.
+        if arg.startswith("-") or arg == "-name":
+            continue
+        # A bare grep pattern (no slash, no dot-path) isn't a path; leave it.
+        candidate = arg
+        # Resolve relative to the workspace, following symlinks.
+        resolved = os.path.realpath(os.path.join(real_workspace, candidate))
+        if resolved != real_workspace and not resolved.startswith(real_workspace + os.sep):
+            logger.warning(f"Blocked shell tool path escaping workspace: {arg!r} -> {resolved}")
+            return False
+    return True
 
 
 def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
@@ -141,8 +184,8 @@ def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
 def execute_shell_command(command: str, args_str: str = "") -> str:
     """
     Executes a whitelisted shell command safely using subprocess without shell=True.
-    Validates arguments against a strict regex whitelist.
-    Strips sensitive environment variables.
+    Validates arguments against a strict regex whitelist, confines file-touching
+    commands to a sandbox workspace, and strips sensitive environment variables.
     """
     command = command.strip().lower()
     args_str = args_str.strip()
@@ -171,20 +214,28 @@ def execute_shell_command(command: str, args_str: str = "") -> str:
     except Exception as e:
         return f"Error: Failed to parse arguments: {str(e)}"
 
-    # 5. Sanitize environment (remove secrets)
+    # 5. Confine filesystem commands to the sandbox workspace.
+    # This is the core defense: .env and the source tree live OUTSIDE this dir,
+    # so no combination of cat/grep/head/tail/find/ls can read secrets.
+    workspace = _workspace_dir()
+    if cmd_config.get("has_path_args"):
+        if not _path_args_are_safe(args_list, workspace):
+            return "Error: Path arguments must stay inside the sandbox workspace. Access denied."
+
+    # 6. Sanitize environment (remove secrets)
     env = os.environ.copy()
     secrets_to_strip = [
         "TELEGRAM_BOT_TOKEN",
         "ZAI_API_KEY",
         "DATABASE_URL",
-        "WEBHOOK_SECRET_TOKEN"
+        "WEBHOOK_SECRET_TOKEN",
     ]
     for secret in secrets_to_strip:
         env.pop(secret, None)
 
-    # 6. Execute the command with a strict timeout
+    # 7. Execute the command with a strict timeout, rooted in the sandbox.
     full_cmd = [bin_path] + args_list
-    logger.info(f"Executing safe command: {full_cmd}")
+    logger.info(f"Executing safe command in {workspace}: {full_cmd}")
 
     try:
         result = subprocess.run(
@@ -193,15 +244,17 @@ def execute_shell_command(command: str, args_str: str = "") -> str:
             stderr=subprocess.PIPE,
             text=True,
             shell=False,
-            timeout=5.0, # Strict 5s timeout
-            env=env
+            timeout=5.0,  # Strict 5s timeout
+            env=env,
+            cwd=workspace,
         )
         output = result.stdout
         if result.stderr:
             output += f"\nError Output:\n{result.stderr}"
         if not output.strip():
             return "[Command completed with no output]"
-        return output
+        # Cap output so a huge file can't blow past Telegram limits / context.
+        return output[:3500]
     except subprocess.TimeoutExpired:
         logger.warning(f"Command execution timed out: {full_cmd}")
         return "Error: Command execution timed out after 5.0 seconds."

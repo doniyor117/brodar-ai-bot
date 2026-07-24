@@ -9,8 +9,73 @@ logger = logging.getLogger(__name__)
 # Connection pool instance
 _pool: Optional[asyncpg.Pool] = None
 
+# Full schema. Every table the bot touches is created here at startup.
+# Previously `chats` and `messages` only existed as SQL in README.md, so on a
+# fresh database every settings read and history write failed silently and
+# group activation lived only in process memory.
+SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS chats (
+        chat_id BIGINT PRIMARY KEY,
+        mention_only BOOLEAN DEFAULT FALSE NOT NULL,
+        is_active BOOLEAN DEFAULT FALSE NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        role VARCHAR(20) NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )
+    """,
+    # History reads are always "latest N for one chat" — without this they are
+    # a full table scan that gets slower every day.
+    """
+    CREATE INDEX IF NOT EXISTS idx_messages_chat_created
+        ON messages (chat_id, created_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS allowed_users (
+        user_id BIGINT PRIMARY KEY,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        id SERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        title VARCHAR(255) DEFAULT 'default' NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_sessions_chat_active
+        ON sessions (chat_id, is_active)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS session_summaries (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        compacted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_store (
+        key VARCHAR(50) PRIMARY KEY,
+        content TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )
+    """,
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS session_id INTEGER",
+]
+
+
 async def init_db_pool() -> asyncpg.Pool:
-    """Initializes the asyncpg connection pool."""
+    """Initializes the asyncpg connection pool and ensures the schema exists."""
     global _pool
     if _pool is not None:
         return _pool
@@ -21,19 +86,36 @@ async def init_db_pool() -> asyncpg.Pool:
 
     logger.info("Initializing asyncpg connection pool...")
     try:
-        # Create connection pool with constrained size to fit Neon free tier
         _pool = await asyncpg.create_pool(
             dsn=config.DATABASE_URL,
             min_size=1,
-            max_size=5,
-            command_timeout=5.0,
-            max_inactive_connection_lifetime=300.0, # 5 minutes lifetime for idle connections
+            max_size=10,
+            # Neon scales to zero; a cold start regularly takes longer than the
+            # 5s this used to allow, which made the first query after idle fail.
+            command_timeout=30.0,
+            timeout=30.0,
+            max_inactive_connection_lifetime=300.0,
         )
         logger.info("asyncpg connection pool initialized successfully.")
+        await init_schema()
         return _pool
     except Exception as e:
         logger.error(f"Failed to initialize database pool: {e}")
         raise
+
+
+async def init_schema() -> None:
+    """Creates every table and index the bot needs. Safe to run repeatedly."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        for statement in SCHEMA_STATEMENTS:
+            try:
+                await conn.execute(statement)
+            except Exception as e:
+                logger.error(f"Schema statement failed: {e}\nStatement: {statement.strip()[:120]}")
+                raise
+    logger.info("Database schema verified (chats, messages, allowed_users, sessions, summaries, memory_store).")
+
 
 async def close_db_pool():
     """Closes the asyncpg connection pool."""
@@ -63,13 +145,13 @@ async def fetch_chat_settings(chat_id: int) -> Dict[str, Any]:
         )
         if row:
             return dict(row)
-        
+
         # Insert default settings if not exists
         try:
             row = await conn.fetchrow(
                 """
                 INSERT INTO chats (chat_id, mention_only, is_active)
-                VALUES ($1, TRUE, FALSE)
+                VALUES ($1, FALSE, FALSE)
                 ON CONFLICT (chat_id) DO UPDATE SET chat_id = EXCLUDED.chat_id
                 RETURNING chat_id, mention_only, is_active
                 """,
@@ -78,7 +160,7 @@ async def fetch_chat_settings(chat_id: int) -> Dict[str, Any]:
             return dict(row)
         except Exception as e:
             logger.error(f"Error creating default chat settings for {chat_id}: {e}")
-            return {"chat_id": chat_id, "mention_only": True, "is_active": False}
+            return {"chat_id": chat_id, "mention_only": False, "is_active": False}
 
 async def update_chat_settings(chat_id: int, mention_only: bool) -> None:
     """Updates the mention_only setting for a specific chat."""
@@ -88,7 +170,7 @@ async def update_chat_settings(chat_id: int, mention_only: bool) -> None:
             """
             INSERT INTO chats (chat_id, mention_only)
             VALUES ($1, $2)
-            ON CONFLICT (chat_id) 
+            ON CONFLICT (chat_id)
             DO UPDATE SET mention_only = EXCLUDED.mention_only
             """,
             chat_id, mention_only
@@ -102,7 +184,7 @@ async def update_chat_active(chat_id: int, is_active: bool) -> None:
             """
             INSERT INTO chats (chat_id, is_active)
             VALUES ($1, $2)
-            ON CONFLICT (chat_id) 
+            ON CONFLICT (chat_id)
             DO UPDATE SET is_active = EXCLUDED.is_active
             """,
             chat_id, is_active
@@ -161,18 +243,27 @@ async def clear_chat_history(chat_id: int) -> None:
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
 
-async def fetch_allowed_users() -> List[int]:
-    """Fetches dynamically added allowed user IDs from the database."""
+
+async def clear_session_summaries(chat_id: int) -> None:
+    """
+    Deletes summary checkpoints for every session of a chat.
+    /clear used to wipe messages but leave summaries behind, so the bot kept
+    recalling "cleared" context from the injected checkpoint.
+    """
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS allowed_users (
-                user_id BIGINT PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-            )
-            """
+            DELETE FROM session_summaries
+            WHERE session_id IN (SELECT id FROM sessions WHERE chat_id = $1)
+            """,
+            chat_id
         )
+
+async def fetch_allowed_users() -> List[int]:
+    """Fetches dynamically added allowed user IDs from the database."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM allowed_users")
         return [r["user_id"] for r in rows]
 
@@ -182,12 +273,8 @@ async def add_allowed_user(user_id: int) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS allowed_users (
-                user_id BIGINT PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-            );
             INSERT INTO allowed_users (user_id) VALUES ($1)
-            ON CONFLICT (user_id) DO NOTHING;
+            ON CONFLICT (user_id) DO NOTHING
             """,
             user_id
         )
@@ -198,34 +285,10 @@ async def remove_allowed_user(user_id: int) -> None:
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM allowed_users WHERE user_id = $1", user_id)
 
-async def init_session_tables() -> None:
-    """Ensures sessions and session_summaries tables exist in DB."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                title VARCHAR(255) DEFAULT 'default' NOT NULL,
-                is_active BOOLEAN DEFAULT TRUE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS session_summaries (
-                id SERIAL PRIMARY KEY,
-                session_id INTEGER NOT NULL,
-                summary TEXT NOT NULL,
-                compacted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-            );
-            ALTER TABLE messages ADD COLUMN IF NOT EXISTS session_id INTEGER;
-            """
-        )
-
 async def fetch_or_create_active_session(chat_id: int) -> Dict[str, Any]:
     """Fetches current active session for a chat, or creates a 'default' session if missing."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await init_session_tables()
         row = await conn.fetchrow(
             "SELECT id, chat_id, title, is_active FROM sessions WHERE chat_id = $1 AND is_active = TRUE ORDER BY created_at DESC LIMIT 1",
             chat_id
@@ -243,7 +306,6 @@ async def create_new_session(chat_id: int, title: str = "new session") -> Dict[s
     """Deactivates current sessions and creates a new active session for the chat."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await init_session_tables()
         async with conn.transaction():
             await conn.execute("UPDATE sessions SET is_active = FALSE WHERE chat_id = $1", chat_id)
             row = await conn.fetchrow(
@@ -256,7 +318,6 @@ async def list_chat_sessions(chat_id: int) -> List[Dict[str, Any]]:
     """Lists all sessions for a chat."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await init_session_tables()
         rows = await conn.fetch(
             "SELECT id, title, is_active, created_at FROM sessions WHERE chat_id = $1 ORDER BY created_at DESC",
             chat_id
@@ -267,7 +328,6 @@ async def switch_active_session(chat_id: int, session_id: int) -> bool:
     """Switches the active session for a chat to session_id."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await init_session_tables()
         async with conn.transaction():
             target = await conn.fetchrow("SELECT id FROM sessions WHERE id = $1 AND chat_id = $2", session_id, chat_id)
             if not target:
@@ -295,25 +355,10 @@ async def fetch_latest_session_summary(session_id: int) -> Optional[str]:
         )
         return row["summary"] if row else None
 
-async def init_memory_store_table() -> None:
-    """Ensures memory_store table exists in DB."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS memory_store (
-                key VARCHAR(50) PRIMARY KEY,
-                content TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-            );
-            """
-        )
-
 async def fetch_stored_memory(key: str = "memory_md") -> Optional[str]:
     """Fetches stored MEMORY.md content from Neon Postgres."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await init_memory_store_table()
         row = await conn.fetchrow("SELECT content FROM memory_store WHERE key = $1", key)
         return row["content"] if row else None
 
@@ -321,7 +366,6 @@ async def save_stored_memory(content: str, key: str = "memory_md") -> None:
     """Persists MEMORY.md content to Neon Postgres."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await init_memory_store_table()
         await conn.execute(
             """
             INSERT INTO memory_store (key, content, updated_at)
@@ -330,6 +374,3 @@ async def save_stored_memory(content: str, key: str = "memory_md") -> None:
             """,
             key, content
         )
-
-
-
