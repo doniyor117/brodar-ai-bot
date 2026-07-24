@@ -893,13 +893,41 @@ async def handle_chat_message(message: Message, bot: Bot):
     privileged = await is_user_privileged(message, bot)
     show_tool_notes = await cache.get_chat_tool_notes(chat_id)
 
-    # Only download/extract visuals if the active model can actually see them.
+    # Vision handling. Only bother if the active model can actually see images.
     image_urls = []
     is_gif = False
-    if has_visual:
-        active_spec = models.resolve_spec(await cache.get_active_model())
-        if active_spec.supports_vision:
-            image_urls, is_gif = await _extract_visual_data_urls(message, bot)
+    had_prior_visual = False
+    vision_on = False
+    if has_visual or config.VISUAL_MEMORY_TURNS > 0:
+        vision_on = models.resolve_spec(await cache.get_active_model()).supports_vision
+
+    if vision_on:
+        # Advance the per-chat turn counter (drives visual aging). Returns the last
+        # turn that carried a visual, so we know whether to look for retained images.
+        turn, last_visual_turn = await cache.bump_chat_turn(chat_id)
+
+        current_urls = []
+        if has_visual:
+            current_urls, is_gif = await _extract_visual_data_urls(message, bot)
+            if current_urls:
+                await cache.remember_visuals(
+                    chat_id, turn,
+                    [{"data_url": u, "is_gif": is_gif} for u in current_urls],
+                )
+                last_visual_turn = turn
+
+        if config.VISUAL_MEMORY_TURNS > 0:
+            min_turn = turn - config.VISUAL_MEMORY_TURNS + 1
+            # Only touch the visuals table if something is actually in the window.
+            if last_visual_turn >= min_turn:
+                retained = await cache.recall_visuals(chat_id, min_turn, config.VISUAL_MEMORY_MAX_IMAGES)
+                image_urls = [r["data_url"] for r in retained]
+                is_gif = is_gif or any(r.get("is_gif") for r in retained)
+                had_prior_visual = any(r["turn"] < turn for r in retained)
+            else:
+                image_urls = current_urls
+        else:
+            image_urls = current_urls
 
     # What we store/show as the user's text (visuals aren't persisted in history).
     # In groups it's prefixed with the speaker's name for multi-person context.
@@ -911,12 +939,22 @@ async def handle_chat_message(message: Message, bot: Bot):
         text_for_model = "[sent an image]"
     else:
         text_for_model = ""
-    # When we send GIF frames, tell the model they're stills from one animation.
-    if is_gif and image_urls:
-        text_for_model += (
-            f"\n\n(note: the {len(image_urls)} image(s) attached are still frames "
-            "extracted from a gif/animation the user sent — first and middle frame.)"
+
+    notes = []
+    if has_visual and not vision_on:
+        notes.append(
+            "the user sent an image/gif but the current model can't see images — "
+            "tell them to switch with /model to a vision model."
         )
+    if is_gif and image_urls:
+        notes.append("some attached images are still frames (first + middle) from a gif/animation.")
+    if had_prior_visual:
+        notes.append(
+            "some attached images are from the last few messages, kept so you can answer "
+            "follow-ups about them; the newest belong to the current message."
+        )
+    if notes:
+        text_for_model += "\n\n(note: " + " ".join(notes) + ")"
     attributed_text = _attribute(message, text_for_model)
 
     history = await cache.get_chat_history(chat_id)

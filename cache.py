@@ -171,6 +171,35 @@ def save_messages_async(chat_id: int, messages: List[Dict[str, str]]) -> None:
     # 2. Trigger Async DB Write
     _spawn_db_write(db.save_messages_batch(chat_id, messages))
 
+# In-memory fallback turn counter if the DB is unreachable.
+_turn_fallback: Dict[int, int] = {}
+
+async def bump_chat_turn(chat_id: int) -> tuple:
+    """Advances the per-chat turn counter. Returns (turn, last_visual_turn)."""
+    try:
+        info = await db.bump_turn(chat_id)
+        return info["msg_turn"], info["last_visual_turn"]
+    except Exception as e:
+        logger.error(f"bump_turn failed for chat {chat_id}: {e}")
+        _turn_fallback[chat_id] = _turn_fallback.get(chat_id, 0) + 1
+        return _turn_fallback[chat_id], 0
+
+async def remember_visuals(chat_id: int, turn: int, items: list) -> None:
+    """Persists this turn's visuals for later follow-up reuse."""
+    try:
+        await db.add_recent_visuals(chat_id, turn, items)
+    except Exception as e:
+        logger.error(f"remember_visuals failed for chat {chat_id}: {e}")
+
+async def recall_visuals(chat_id: int, min_turn: int, limit: int) -> list:
+    """Prunes expired visuals, then returns those still within the retention window."""
+    try:
+        await db.prune_recent_visuals(chat_id, max(1, min_turn))
+        return await db.fetch_recent_visuals(chat_id, min_turn, limit)
+    except Exception as e:
+        logger.error(f"recall_visuals failed for chat {chat_id}: {e}")
+        return []
+
 def invalidate_history(chat_id: int) -> None:
     """
     Drops the in-memory history for a chat WITHOUT touching the DB, forcing the

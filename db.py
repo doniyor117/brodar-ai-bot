@@ -24,6 +24,22 @@ SCHEMA_STATEMENTS = [
     """,
     # Migration for chats tables created before show_tool_notes existed.
     "ALTER TABLE chats ADD COLUMN IF NOT EXISTS show_tool_notes BOOLEAN DEFAULT TRUE NOT NULL",
+    # Per-chat monotonic turn counter + the last turn that carried a visual,
+    # used to age out retained visuals without extra queries.
+    "ALTER TABLE chats ADD COLUMN IF NOT EXISTS msg_turn INTEGER DEFAULT 0 NOT NULL",
+    "ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_visual_turn INTEGER DEFAULT 0 NOT NULL",
+    # Recently-sent images/GIF frames, kept for a few turns for follow-up vision.
+    """
+    CREATE TABLE IF NOT EXISTS recent_visuals (
+        id SERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        turn INTEGER NOT NULL,
+        data_url TEXT NOT NULL,
+        is_gif BOOLEAN DEFAULT FALSE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_recent_visuals_chat_turn ON recent_visuals (chat_id, turn)",
     """
     CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -270,6 +286,72 @@ async def clear_chat_history(chat_id: int) -> None:
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
+
+
+async def bump_turn(chat_id: int) -> Dict[str, int]:
+    """
+    Increments the per-chat turn counter and returns both it and the last turn
+    that carried a visual (so callers can decide whether to look for retained
+    images without an extra query).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO chats (chat_id, msg_turn) VALUES ($1, 1)
+            ON CONFLICT (chat_id) DO UPDATE SET msg_turn = chats.msg_turn + 1
+            RETURNING msg_turn, last_visual_turn
+            """,
+            chat_id,
+        )
+        if not row:
+            return {"msg_turn": 0, "last_visual_turn": 0}
+        return {"msg_turn": row["msg_turn"], "last_visual_turn": row["last_visual_turn"]}
+
+
+async def add_recent_visuals(chat_id: int, turn: int, items: List[Dict[str, Any]]) -> None:
+    """Stores this turn's visuals and marks it as the chat's last visual turn."""
+    if not items:
+        return
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for it in items:
+                await conn.execute(
+                    "INSERT INTO recent_visuals (chat_id, turn, data_url, is_gif) VALUES ($1, $2, $3, $4)",
+                    chat_id, turn, it["data_url"], bool(it.get("is_gif")),
+                )
+            await conn.execute(
+                "UPDATE chats SET last_visual_turn = $2 WHERE chat_id = $1",
+                chat_id, turn,
+            )
+
+
+async def fetch_recent_visuals(chat_id: int, min_turn: int, limit: int) -> List[Dict[str, Any]]:
+    """Returns retained visuals with turn >= min_turn, oldest first, capped at `limit`."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT data_url, is_gif, turn FROM recent_visuals
+            WHERE chat_id = $1 AND turn >= $2
+            ORDER BY id DESC
+            LIMIT $3
+            """,
+            chat_id, min_turn, limit,
+        )
+        # DESC + reverse => newest kept under the cap, returned oldest-first.
+        return [dict(r) for r in reversed(rows)]
+
+
+async def prune_recent_visuals(chat_id: int, min_turn: int) -> None:
+    """Deletes visuals older than the retention window for a chat."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM recent_visuals WHERE chat_id = $1 AND turn < $2",
+            chat_id, min_turn,
+        )
 
 
 async def delete_old_messages(chat_id: int, keep_last_n: int) -> int:
