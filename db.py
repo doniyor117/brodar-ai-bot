@@ -226,12 +226,16 @@ async def fetch_chat_history(chat_id: int, limit: int = 20) -> List[Dict[str, st
             """
             SELECT role, content FROM messages
             WHERE chat_id = $1
-            ORDER BY created_at DESC
+            ORDER BY id DESC
             LIMIT $2
             """,
             chat_id, limit
         )
-        # Reverse to get chronological order (oldest to newest)
+        # Order by id (monotonic insert order), NOT created_at: a user message and
+        # the bot's reply are saved in one batch and share an identical timestamp,
+        # so ordering by created_at scrambles who-said-what and breaks the model's
+        # view of the conversation. id always reflects true insertion order.
+        # Reverse to get chronological order (oldest to newest).
         history = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
         return history
 
