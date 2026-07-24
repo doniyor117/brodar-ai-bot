@@ -1,12 +1,14 @@
 import logging
+import asyncio
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.filters import Command, BaseFilter
-from aiogram.types import Message, TelegramObject
+from aiogram.types import Message, TelegramObject, CallbackQuery
 from aiogram.utils.chat_action import ChatActionSender
 
 import config
 import cache
 import agent
+import permissions
 
 logger = logging.getLogger(__name__)
 
@@ -119,15 +121,18 @@ class ShouldRespondFilter(BaseFilter):
 
         return False
 
-async def is_sender_admin(message: Message, bot: Bot) -> bool:
+async def is_sender_admin(message: Message, bot: Bot, user_id: int = None) -> bool:
     """Checks if the user who sent the command is an administrator in the chat."""
     if message.chat.type == "private":
         return True
+    check_user_id = user_id or (message.from_user.id if message.from_user else None)
+    if not check_user_id:
+        return False
     try:
-        member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        member = await bot.get_chat_member(message.chat.id, check_user_id)
         return member.status in ("creator", "administrator")
     except Exception as e:
-        logger.warning(f"Error checking admin status for user {message.from_user.id} in chat {message.chat.id}: {e}")
+        logger.warning(f"Error checking admin status for user {check_user_id} in chat {message.chat.id}: {e}")
         return False
 
 @router.message(Command("start"))
@@ -158,6 +163,21 @@ async def cmd_help(message: Message):
         "- /toggle_reply (group admins): toggle mention-only vs reply-all mode."
     )
     await message.reply(text)
+
+@router.message(Command("toggle_reply"))
+async def cmd_toggle_reply(message: Message, bot: Bot):
+    """Toggles mention-only vs free-reply mode in group chats."""
+    chat_id = message.chat.id
+    if message.chat.type == "private":
+        await message.reply("this command only works in groups.")
+        return
+    if not await is_sender_admin(message, bot):
+        await message.reply("nice try, but you're not a group admin.")
+        return
+    current = await cache.get_chat_setting(chat_id)
+    cache.set_chat_setting(chat_id, not current)
+    mode = "mention-only" if not current else "free-reply"
+    await message.reply(f"reply mode switched to: {mode}.")
 
 @router.message(Command("activate"))
 async def cmd_activate(message: Message):
@@ -451,7 +471,7 @@ async def cmd_unmute(message: Message, bot: Bot):
 async def cmd_stop_all(message: Message):
     """Global Emergency Abort handler across all chats."""
     user_id = message.from_user.id if message.from_user else 0
-    if not cache.is_user_allowed(user_id):
+    if not await cache.is_user_allowed(user_id):
         await message.reply("nice try, but only authorized admins can run global stop.")
         return
     count = await agent.cancel_all_tasks()
@@ -494,8 +514,7 @@ async def cmd_demote(message: Message, bot: Bot):
     res = await group_tools.demote_from_admin(bot, message.chat.id, target_uid)
     await message.reply(res)
 
-import permissions
-from aiogram.types import CallbackQuery
+# permissions and CallbackQuery imported at top of file
 
 @router.callback_query(permissions.PermCallback.filter())
 async def handle_permission_callback(callback: CallbackQuery, callback_data: permissions.PermCallback, bot: Bot):
@@ -551,7 +570,6 @@ async def cmd_set_title(message: Message, bot: Bot):
     await message.reply(res)
 
 @router.message(ShouldRespondFilter())
-
 async def handle_chat_message(message: Message, bot: Bot):
     """
     General message handler that handles conversational response generation.

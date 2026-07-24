@@ -22,6 +22,17 @@ except ImportError:
 # Concurrency semaphore to serialize requests to Z.ai (Free tier concurrency guard)
 _concurrency_semaphore = asyncio.Semaphore(1)
 
+# Active agent tasks per chat_id for emergency stop support
+_running_tasks: Dict[int, asyncio.Task] = {}
+
+def register_running_task(chat_id: int, task: asyncio.Task) -> None:
+    """Registers the current asyncio.Task for a chat_id for emergency cancellation."""
+    _running_tasks[chat_id] = task
+
+def unregister_running_task(chat_id: int) -> None:
+    """Removes a completed task from the tracking dictionary."""
+    _running_tasks.pop(chat_id, None)
+
 # Multi-turn few-shot examples for casual/sarcastic personality in lowercase
 FEW_SHOTS = [
     {"role": "user", "content": "can you explain quantum computing?"},
@@ -183,13 +194,13 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "group_moderation_tool",
-            "description": "Performs group moderation actions (ban, mute, unmute, set_title, set_description, pin_message, promote_admin, demote_admin) if requested by a group admin.",
+            "description": "Performs group moderation actions (ban, unban, mute, unmute, set_title, set_description, pin_message, promote_admin, demote_admin) if requested by a group admin.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "Action name: ban, mute, unmute, set_title, set_description, pin_message, promote_admin, demote_admin"
+                        "description": "Action name: ban, unban, mute, unmute, set_title, set_description, pin_message, promote_admin, demote_admin"
                     },
                     "target_user_id": {
                         "type": "integer",
@@ -412,6 +423,9 @@ async def generate_response(chat_history: List[Dict[str, str]], bot_instance: Op
                             tool_result = await group_tools.promote_to_admin(bot_instance, chat_id, target_uid, text_p or "Admin")
                         elif act == "demote_admin":
                             tool_result = await group_tools.demote_from_admin(bot_instance, chat_id, target_uid)
+                        elif act == "pin_message":
+                            msg_id = args.get("target_user_id", 0)  # reuse target_user_id field for message_id
+                            tool_result = await group_tools.pin_message(bot_instance, chat_id, msg_id)
                         else:
                             tool_result = f"Unknown moderation action '{act}'."
                 else:
