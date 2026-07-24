@@ -366,10 +366,16 @@ async def _notify(bot_instance: Optional[Any], chat_id: Optional[int], text: str
         logger.warning(f"Failed to send tool-status note to chat {chat_id}: {e}")
 
 
+def _image_blocks(urls: List[str]) -> List[Dict[str, Any]]:
+    return [{"type": "image_url", "image_url": {"url": u}} for u in urls]
+
+
 def _attach_images_to_last_user(full_messages: List[Dict[str, Any]], image_urls: List[str]) -> None:
     """
     Rewrites the last user message into OpenAI-style multimodal content blocks
-    (text + image_url), which LiteLLM forwards to vision models.
+    (text first, then its images), which LiteLLM forwards to vision models.
+    Ordering matters: the text (the user's question) comes before the image(s)
+    it refers to, and images are appended in the order given.
     """
     for msg in reversed(full_messages):
         if msg.get("role") == "user":
@@ -379,10 +385,28 @@ def _attach_images_to_last_user(full_messages: List[Dict[str, Any]], image_urls:
             blocks: List[Dict[str, Any]] = []
             if text:
                 blocks.append({"type": "text", "text": text})
-            for url in image_urls:
-                blocks.append({"type": "image_url", "image_url": {"url": url}})
+            blocks.extend(_image_blocks(image_urls))
             msg["content"] = blocks
             return
+
+
+def _insert_context_images(full_messages: List[Dict[str, Any]], image_urls: List[str]) -> None:
+    """
+    Inserts prior-turn images as their own user message immediately BEFORE the
+    current turn, in chronological (oldest-first) order. This preserves the real
+    sequence — earlier images stay earlier in the conversation instead of being
+    lumped onto the latest message where their order would be lost.
+    """
+    if not image_urls:
+        return
+    blocks: List[Dict[str, Any]] = [
+        {"type": "text", "text": "(images shared earlier in this chat, oldest first, for context)"}
+    ]
+    blocks.extend(_image_blocks(image_urls))
+    ctx_msg = {"role": "user", "content": blocks}
+    # Insert just before the last message (the current user turn).
+    insert_at = max(0, len(full_messages) - 1)
+    full_messages.insert(insert_at, ctx_msg)
 
 
 async def generate_response(
@@ -392,6 +416,7 @@ async def generate_response(
     requester_is_privileged: bool = False,
     show_tool_notes: bool = True,
     image_urls: Optional[List[str]] = None,
+    context_image_urls: Optional[List[str]] = None,
 ) -> str:
     """
     Generates a response from the AI Agent bot.
@@ -458,20 +483,22 @@ async def generate_response(
     full_messages.extend(FEW_SHOTS)
     full_messages.extend(chat_history)
 
-    # Attach images to the latest user turn — but only if the active model can
-    # actually see them. Otherwise let the model know so it doesn't pretend.
-    if image_urls:
-        if spec.supports_vision:
+    # Attach images — only if the active model can actually see them. Prior-turn
+    # images go in as a chronological context block before the current turn; the
+    # current message's own images stay attached to it (order preserved).
+    if spec.supports_vision:
+        if context_image_urls:
+            _insert_context_images(full_messages, context_image_urls)
+        if image_urls:
             _attach_images_to_last_user(full_messages, image_urls)
-        else:
-            full_messages.append({
-                "role": "system",
-                "content": (
-                    f"the user sent {len(image_urls)} image(s), but the current model "
-                    f"({spec.label}) can't see images. tell them to switch to a vision "
-                    "model with /model if they want you to look."
-                ),
-            })
+    elif image_urls or context_image_urls:
+        full_messages.append({
+            "role": "system",
+            "content": (
+                f"the user sent image(s), but the current model ({spec.label}) can't "
+                "see images. tell them to switch to a vision model with /model."
+            ),
+        })
 
     max_tool_loops = 6
 

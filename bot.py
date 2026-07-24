@@ -893,7 +893,8 @@ async def handle_chat_message(message: Message, bot: Bot):
     show_tool_notes = await cache.get_chat_tool_notes(chat_id)
 
     # Vision handling. Only bother if the active model can actually see images.
-    image_urls = []
+    image_urls = []            # current turn's images (attached to this message)
+    context_image_urls = []    # prior turns' images (chronological context block)
     is_gif = False
     had_prior_visual = False
     vision_on = False
@@ -920,9 +921,11 @@ async def handle_chat_message(message: Message, bot: Bot):
             # Only touch the visuals table if something is actually in the window.
             if last_visual_turn >= min_turn:
                 retained = await cache.recall_visuals(chat_id, min_turn, config.VISUAL_MEMORY_MAX_IMAGES)
-                image_urls = [r["data_url"] for r in retained]
+                # Keep chronological order; split "this turn" from earlier turns.
+                image_urls = [r["data_url"] for r in retained if r["turn"] >= turn]
+                context_image_urls = [r["data_url"] for r in retained if r["turn"] < turn]
                 is_gif = is_gif or any(r.get("is_gif") for r in retained)
-                had_prior_visual = any(r["turn"] < turn for r in retained)
+                had_prior_visual = bool(context_image_urls)
             else:
                 image_urls = current_urls
         else:
@@ -974,6 +977,7 @@ async def handle_chat_message(message: Message, bot: Bot):
                 requester_is_privileged=privileged,
                 show_tool_notes=show_tool_notes,
                 image_urls=image_urls or None,
+                context_image_urls=context_image_urls or None,
             )
 
         if config.FORCE_LOWERCASE:
@@ -1021,13 +1025,28 @@ async def handle_group_passive(message: Message, bot: Bot):
         return
 
     text = (message.text or message.caption or "").strip()
-    if not text:
+    has_visual = _message_has_visual(message)
+    if not text and not has_visual:
         return
 
-    # Prime the in-memory cache from DB first (so we append, not overwrite), then
-    # store this message attributed to its speaker.
-    await cache.get_chat_history(chat_id)
-    cache.save_messages_async(chat_id, [{"role": "user", "content": _attribute(message, text)}])
+    # Capture images posted WITHOUT mentioning the bot, so when it's later
+    # @-mentioned it can still see them (the mention-only blind spot). Only when a
+    # vision model is active — otherwise there's nothing that could use them.
+    if has_visual:
+        spec = models.resolve_spec(await cache.get_active_model())
+        if spec.supports_vision:
+            turn, _ = await cache.bump_chat_turn(chat_id)
+            urls, is_gif = await _extract_visual_data_urls(message, bot)
+            if urls:
+                await cache.remember_visuals(
+                    chat_id, turn, [{"data_url": u, "is_gif": is_gif} for u in urls]
+                )
+
+    # Log the message (attributed) so the transcript reflects it — including a
+    # placeholder for image-only posts.
+    logged = text or ("[sent a gif]" if message.animation else "[sent an image]")
+    await cache.get_chat_history(chat_id)  # prime cache so we append, not overwrite
+    cache.save_messages_async(chat_id, [{"role": "user", "content": _attribute(message, logged)}])
 
     # Keep group context from growing unbounded.
     import session_manager
