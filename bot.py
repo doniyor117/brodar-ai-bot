@@ -759,6 +759,24 @@ async def cmd_set_title(message: Message, bot: Bot):
     res = await group_tools.set_group_title(bot, message.chat.id, new_title)
     await message.reply(res)
 
+def _speaker_name(message: Message) -> str:
+    """A short display name for a group speaker."""
+    u = message.from_user
+    if not u:
+        return "someone"
+    return u.full_name or (f"@{u.username}" if u.username else str(u.id))
+
+
+def _attribute(message: Message, text: str) -> str:
+    """
+    In group chats, prefix a message with who said it ("alex: hey") so the model
+    can follow a multi-person conversation. DMs are left as-is (1:1, no ambiguity).
+    """
+    if message.chat.type in ("group", "supergroup"):
+        return f"{_speaker_name(message)}: {text}"
+    return text
+
+
 MAX_IMAGE_BYTES = 4 * 1024 * 1024  # skip anything larger than 4MB
 
 
@@ -828,10 +846,12 @@ async def handle_chat_message(message: Message, bot: Bot):
             image_urls = await _extract_image_data_urls(message, bot)
 
     # What we store/show as the user's text (images aren't persisted in history).
+    # In groups it's prefixed with the speaker's name for multi-person context.
     text_for_model = cleaned_text or ("[sent an image]" if has_image else "")
+    attributed_text = _attribute(message, text_for_model)
 
     history = await cache.get_chat_history(chat_id)
-    user_msg_entry = {"role": "user", "content": text_for_model}
+    user_msg_entry = {"role": "user", "content": attributed_text}
     temp_history = history + [user_msg_entry]
 
     current_task = asyncio.current_task()
@@ -857,7 +877,7 @@ async def handle_chat_message(message: Message, bot: Bot):
         # still saved to history instead of being silently lost. Images aren't
         # stored (they'd bloat history); a placeholder marks that one was sent.
         cache.save_messages_async(chat_id, [
-            {"role": "user", "content": text_for_model},
+            {"role": "user", "content": attributed_text},
             {"role": "assistant", "content": bot_reply},
         ])
 
@@ -874,3 +894,26 @@ async def handle_chat_message(message: Message, bot: Bot):
             logger.error(f"Failed to send error message: {send_err}")
     finally:
         agent.unregister_running_task(chat_id, current_task)
+
+
+@router.message(F.chat.type.in_({"group", "supergroup"}))
+async def handle_group_passive(message: Message, bot: Bot):
+    """
+    Passively records group messages the bot did NOT reply to (e.g. mention-only
+    mode, non-mention chatter) into history, so when it IS mentioned it has the
+    surrounding conversation as context. Registered AFTER handle_chat_message, so
+    it only ever sees the fall-through messages. It never replies.
+    """
+    chat_id = message.chat.id
+    # Only build context for groups the bot has been activated in.
+    if not await cache.get_chat_active(chat_id):
+        return
+
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return
+
+    # Prime the in-memory cache from DB first (so we append, not overwrite), then
+    # store this message attributed to its speaker.
+    await cache.get_chat_history(chat_id)
+    cache.save_messages_async(chat_id, [{"role": "user", "content": _attribute(message, text)}])
