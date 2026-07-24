@@ -10,6 +10,9 @@ logger = logging.getLogger(__name__)
 # Maps chat_id (int) -> mention_only (bool)
 _settings_cache: Dict[int, bool] = {}
 
+# Maps chat_id (int) -> is_active (bool)
+_active_cache: Dict[int, bool] = {}
+
 # Maps chat_id (int) -> deque of messages (role/content dicts)
 _history_cache: Dict[int, deque] = {}
 HISTORY_MAXLEN = 20
@@ -33,6 +36,9 @@ async def get_chat_setting(chat_id: int) -> bool:
         settings = await db.fetch_chat_settings(chat_id)
         mention_only = settings.get("mention_only", True)
         _settings_cache[chat_id] = mention_only
+        # Also cache is_active since we fetched it
+        if "is_active" in settings:
+            _active_cache[chat_id] = settings["is_active"]
         return mention_only
     except Exception as e:
         logger.error(f"Error fetching settings for chat {chat_id} from DB, using default (True): {e}")
@@ -46,6 +52,36 @@ def set_chat_setting(chat_id: int, mention_only: bool) -> None:
     
     # Run DB write in background
     task = asyncio.create_task(db.update_chat_settings(chat_id, mention_only))
+    task.add_done_callback(_handle_db_write_error)
+
+async def get_chat_active(chat_id: int) -> bool:
+    """
+    Retrieves the is_active setting for a chat.
+    Checks the cache first; on a miss, reads from the database.
+    """
+    if chat_id in _active_cache:
+        return _active_cache[chat_id]
+
+    try:
+        settings = await db.fetch_chat_settings(chat_id)
+        is_active = settings.get("is_active", False)
+        _active_cache[chat_id] = is_active
+        # Also cache mention_only since we fetched it
+        if "mention_only" in settings:
+            _settings_cache[chat_id] = settings["mention_only"]
+        return is_active
+    except Exception as e:
+        logger.error(f"Error fetching active status for chat {chat_id} from DB, using default (False): {e}")
+        return False
+
+def set_chat_active(chat_id: int, is_active: bool) -> None:
+    """
+    Updates the active status in the cache and triggers an async background DB write.
+    """
+    _active_cache[chat_id] = is_active
+    
+    # Run DB write in background
+    task = asyncio.create_task(db.update_chat_active(chat_id, is_active))
     task.add_done_callback(_handle_db_write_error)
 
 async def get_chat_history(chat_id: int) -> List[Dict[str, str]]:

@@ -1,7 +1,7 @@
 import logging
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.filters import Command, BaseFilter
-from aiogram.types import Message
+from aiogram.types import Message, TelegramObject
 from aiogram.utils.chat_action import ChatActionSender
 
 import config
@@ -12,6 +12,52 @@ logger = logging.getLogger(__name__)
 
 # Router for all bot handlers
 router = Router()
+
+class AccessControlMiddleware(BaseMiddleware):
+    """
+    Enforces access control policies:
+    1. Private chats (DMs) must be from allowed user IDs.
+    2. Group chats must be active (is_active = True), except for /activate and /deactivate commands.
+    3. Commands like /activate and /deactivate must only be run by allowed user IDs.
+    """
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        if not isinstance(event, Message):
+            return await handler(event, data)
+
+        message: Message = event
+        user_id = message.from_user.id if message.from_user else None
+        chat_id = message.chat.id
+        chat_type = message.chat.type
+
+        # 1. Private Chat Check (DMs)
+        if chat_type == "private":
+            if user_id not in config.ALLOWED_DM_USER_IDS:
+                logger.info(f"Ignoring DM from unauthorized user ID: {user_id}")
+                return  # silently ignore
+            return await handler(event, data)
+
+        # 2. Group Chat Check
+        text = message.text or message.caption or ""
+        # Check if the command is /activate or /deactivate
+        is_activate = text.strip().startswith("/activate")
+        is_deactivate = text.strip().startswith("/deactivate")
+
+        if is_activate or is_deactivate:
+            if user_id not in config.ALLOWED_DM_USER_IDS:
+                logger.info(f"Ignoring activation command '{text}' from unauthorized user {user_id} in group {chat_id}")
+                return  # silently ignore
+            return await handler(event, data)
+
+        # For any other message/command in group chats, check if group is active
+        is_active = await cache.get_chat_active(chat_id)
+        if not is_active:
+            # Silently ignore all messages and commands in inactive group chats
+            return
+
+        return await handler(event, data)
+
+# Register the outer middleware on the router
+router.message.outer_middleware(AccessControlMiddleware())
 
 # Global cache for the bot's own username to prevent redundant API calls
 BOT_USERNAME = None
@@ -29,16 +75,24 @@ async def init_bot_info(bot: Bot):
 class ShouldRespondFilter(BaseFilter):
     """
     Determines if the bot should process and respond to a message:
-    1. Private Chat (DMs) -> Always responds.
+    1. Private Chat (DMs) -> Checks if user is in ALLOWED_DM_USER_IDS.
     2. Group / Supergroup:
+       - Checks if group is active (is_active). If not, ignores.
        - Responds if Mention-Only is disabled.
        - Responds if Mention-Only is enabled AND the bot is mentioned or replied to.
     """
     async def __call__(self, message: Message, bot: Bot) -> bool:
         if message.chat.type == "private":
-            return True
+            user_id = message.from_user.id if message.from_user else None
+            return user_id in config.ALLOWED_DM_USER_IDS
 
         chat_id = message.chat.id
+        
+        # Check if group is active first
+        is_active = await cache.get_chat_active(chat_id)
+        if not is_active:
+            return False
+
         # Read setting from write-through cache
         mention_only = await cache.get_chat_setting(chat_id)
 
@@ -80,7 +134,8 @@ async def cmd_start(message: Message):
     text = (
         "oh, hello. i'm an ai assistant bot.\n"
         "i can reply to your text, search the web, or run safe shell utilities.\n"
-        "in groups, i only reply when mentioned by default. admins can use /toggle_reply to change that.\n"
+        "in groups, i must be /activate-d first by an allowed administrator.\n"
+        "once active, i only reply when mentioned by default. group admins can use /toggle_reply to change that.\n"
         "ask me anything. or don't. i don't really mind."
     )
     await message.reply(text)
@@ -92,9 +147,33 @@ async def cmd_help(message: Message):
         "here is what you can do with me:\n"
         "- type anything to talk. i'll respond using an llm.\n"
         "- i might use web search or shell tools in the background if you ask for it.\n"
-        "- /toggle_reply (admins only): toggle whether i reply to all messages in groups or only mentions."
+        "- /activate (authorized users only): enable the bot in a group chat.\n"
+        "- /deactivate (authorized users only): disable the bot in a group chat.\n"
+        "- /toggle_reply (group admins only): toggle whether i reply to all messages in groups or only mentions."
     )
     await message.reply(text)
+
+@router.message(Command("activate"))
+async def cmd_activate(message: Message):
+    """Activates the bot in the group. Casual and lowercase."""
+    chat_id = message.chat.id
+    if message.chat.type == "private":
+        await message.reply("this is a private chat. i'm already active here.")
+        return
+
+    cache.set_chat_active(chat_id, True)
+    await message.reply("system activated. i will now listen and respond to messages in this group.")
+
+@router.message(Command("deactivate"))
+async def cmd_deactivate(message: Message):
+    """Deactivates the bot in the group. Casual and lowercase."""
+    chat_id = message.chat.id
+    if message.chat.type == "private":
+        await message.reply("you can't deactivate me in private chats, buddy. just delete the chat or block me.")
+        return
+
+    cache.set_chat_active(chat_id, False)
+    await message.reply("system deactivated. going dark in this group. bye.")
 
 @router.message(Command("toggle_reply"))
 async def cmd_toggle_reply(message: Message, bot: Bot):

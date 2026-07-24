@@ -58,7 +58,7 @@ async def fetch_chat_settings(chat_id: int) -> Dict[str, Any]:
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT chat_id, mention_only FROM chats WHERE chat_id = $1",
+            "SELECT chat_id, mention_only, is_active FROM chats WHERE chat_id = $1",
             chat_id
         )
         if row:
@@ -68,17 +68,17 @@ async def fetch_chat_settings(chat_id: int) -> Dict[str, Any]:
         try:
             row = await conn.fetchrow(
                 """
-                INSERT INTO chats (chat_id, mention_only)
-                VALUES ($1, TRUE)
+                INSERT INTO chats (chat_id, mention_only, is_active)
+                VALUES ($1, TRUE, FALSE)
                 ON CONFLICT (chat_id) DO UPDATE SET chat_id = EXCLUDED.chat_id
-                RETURNING chat_id, mention_only
+                RETURNING chat_id, mention_only, is_active
                 """,
                 chat_id
             )
             return dict(row)
         except Exception as e:
             logger.error(f"Error creating default chat settings for {chat_id}: {e}")
-            return {"chat_id": chat_id, "mention_only": True}
+            return {"chat_id": chat_id, "mention_only": True, "is_active": False}
 
 async def update_chat_settings(chat_id: int, mention_only: bool) -> None:
     """Updates the mention_only setting for a specific chat."""
@@ -93,6 +93,21 @@ async def update_chat_settings(chat_id: int, mention_only: bool) -> None:
             """,
             chat_id, mention_only
         )
+
+async def update_chat_active(chat_id: int, is_active: bool) -> None:
+    """Updates the is_active status for a specific chat."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO chats (chat_id, is_active)
+            VALUES ($1, $2)
+            ON CONFLICT (chat_id) 
+            DO UPDATE SET is_active = EXCLUDED.is_active
+            """,
+            chat_id, is_active
+        )
+
 
 async def fetch_chat_history(chat_id: int, limit: int = 20) -> List[Dict[str, str]]:
     """

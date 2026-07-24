@@ -39,10 +39,11 @@ To keep the bot lightweight and efficient, we use **raw SQL migrations** via the
 Log in to your [Neon Console](https://console.neon.tech/), select your database, open the **SQL Editor**, and run the following statements:
 
 ```sql
--- 1. Create the Chats table to persist reply preferences
+-- 1. Create the Chats table to persist reply preferences and activation state
 CREATE TABLE IF NOT EXISTS chats (
     chat_id BIGINT PRIMARY KEY,
-    mention_only BOOLEAN DEFAULT TRUE NOT NULL
+    mention_only BOOLEAN DEFAULT TRUE NOT NULL,
+    is_active BOOLEAN DEFAULT FALSE NOT NULL
 );
 
 -- 2. Create the Messages table for long-term chat histories
@@ -154,3 +155,16 @@ Instead of ORMs (like SQLAlchemy), the project implements a raw SQL connection p
 
 ### 4. LLM Concurrency Guard
 The Z.ai free tier rate limits request concurrency to 1. To prevent `429` (Too Many Requests) errors, the agent utilizes a global `asyncio.Semaphore(1)` in [agent.py](file:///root/.gemini/antigravity-cli/scratch/telegram_bot/agent.py) to serialize LLM queries. Overlapping messages in group chats are queued and answered sequentially. If peak-hour throttling triggers rate limit responses (`1302` or `1305`), the API client performs up to 5 retries with exponential backoff and random jitter.
+
+---
+
+## 7. Changelog
+
+### DM Access Control & Group Chat Opt-in (2026-07-24)
+* **DM Access Control (Allowlist Only)**: The bot is updated to only respond in private/DM chats to specific user IDs (`2030903420`, `8116285130`). DMs from any other users are silently ignored. Configured via the `ALLOWED_DM_USER_IDS` environment variable.
+* **Group Opt-in Model**: The bot will no longer respond in group chats by default. It must be explicitly activated in each group chat first using the `/activate` command.
+* **Commands**:
+  * `/activate` (restricted to allowed user IDs): Activates the bot in a group chat.
+  * `/deactivate` (restricted to allowed user IDs): Deactivates the bot in a group chat (silences all responses).
+* **Database Updates**: Added the `is_active` boolean column to the `chats` table, defaulting to `FALSE`. Added a migration script segment and updated the cache mechanism to support write-through caching of the active status.
+

@@ -5,8 +5,8 @@ The implementation of the group-chat capable Telegram AI Agent Bot has been comp
 ---
 
 ## 1. Directory & File Structure
-All source code files have been created in the local scratch directory:
-`[telegram_bot/](file:///root/.gemini/antigravity-cli/scratch/telegram_bot)`
+All source code files are in the project workspace directory:
+`[brodar-ai-bot/](file:///mnt/projects/brodar-ai-bot)`
 
 ```text
 telegram_bot/
@@ -45,7 +45,8 @@ There were **no structural deviations** from the finalized architecture in `RESE
 To run or deploy the bot, you need to perform the following steps:
 
 1. **Activate the Workspace**:
-   Set `/root/.gemini/antigravity-cli/scratch/telegram_bot` as your active project workspace.
+   Set `/mnt/projects/brodar-ai-bot` as your active project workspace.
+
 
 2. **Obtain API Keys & Tokens**:
    * **Telegram Bot**: Message [@BotFather](https://t.me/BotFather) on Telegram and run `/newbot` to get your `TELEGRAM_BOT_TOKEN`.
@@ -55,10 +56,15 @@ To run or deploy the bot, you need to perform the following steps:
 3. **Run Postgres Migration**:
    Connect to your Neon database via the Neon SQL console and run the following queries to create the schema:
    ```sql
-   CREATE TABLE IF NOT EXISTS chats (
-       chat_id BIGINT PRIMARY KEY,
-       mention_only BOOLEAN DEFAULT TRUE NOT NULL
-   );
+    CREATE TABLE IF NOT EXISTS chats (
+        chat_id BIGINT PRIMARY KEY,
+        mention_only BOOLEAN DEFAULT TRUE NOT NULL,
+        is_active BOOLEAN DEFAULT FALSE NOT NULL
+    );
+
+    -- To migrate an existing chats table:
+    ALTER TABLE chats ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE NOT NULL;
+
 
    CREATE TABLE IF NOT EXISTS messages (
        id SERIAL PRIMARY KEY,
@@ -75,3 +81,14 @@ To run or deploy the bot, you need to perform the following steps:
 4. **Deploying (to Render or local)**:
    * **Local**: Copy `.env.example` to `.env`, populate the credentials, and execute `python main.py` (ensure to use a tunnel like ngrok for the webhook).
    * **Production**: Push the codebase to a GitHub repository, create a **Blueprint** service on Render, select the repository, and approve the deployment.
+
+---
+
+## 5. Security and Access Control Updates (2026-07-24)
+
+1. **DM Access Allowlist**: Implemented user ID allowlist verification in DM chats (`ALLOWED_DM_USER_IDS` in `.env`). Unauthorized users are silently ignored.
+2. **Group Chat Opt-in**: The bot defaults to inactive (`is_active = FALSE`) for new group chats.
+3. **Commands Added**:
+   - `/activate`: Allowed users can activate a group chat.
+   - `/deactivate`: Allowed users can deactivate a group chat.
+
