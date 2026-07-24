@@ -2,6 +2,7 @@ import asyncio
 import logging
 from collections import deque
 from typing import Dict, List, Optional
+import config
 import db
 
 logger = logging.getLogger(__name__)
@@ -18,7 +19,7 @@ _tool_notes_cache: Dict[int, bool] = {}
 
 # Maps chat_id (int) -> deque of messages (role/content dicts)
 _history_cache: Dict[int, deque] = {}
-HISTORY_MAXLEN = 20
+HISTORY_MAXLEN = config.HISTORY_MAXLEN
 
 # Strong references to background DB-write tasks. Without this the event loop
 # only weakly references them and the GC can cancel a write before it lands.
@@ -169,6 +170,13 @@ def save_messages_async(chat_id: int, messages: List[Dict[str, str]]) -> None:
     
     # 2. Trigger Async DB Write
     _spawn_db_write(db.save_messages_batch(chat_id, messages))
+
+def invalidate_history(chat_id: int) -> None:
+    """
+    Drops the in-memory history for a chat WITHOUT touching the DB, forcing the
+    next read to reload from the database. Used after compaction trims the DB.
+    """
+    _history_cache.pop(chat_id, None)
 
 async def clear_chat_history(chat_id: int) -> None:
     """Clears conversation history from in-memory cache and triggers background DB deletion."""

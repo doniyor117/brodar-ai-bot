@@ -87,6 +87,31 @@ async def cancel_all_tasks() -> int:
     _running_tasks.clear()
     return count
 
+def count_tokens(messages: List[Dict[str, Any]], model: Optional[str] = None) -> int:
+    """
+    Estimates the token count of a list of chat messages. Uses litellm's
+    model-aware counter when possible, falling back to a ~4-chars-per-token
+    heuristic (which is plenty accurate for a 100k gate).
+    """
+    if LITELLM_AVAILABLE and litellm is not None:
+        try:
+            return litellm.token_counter(model=model or "gpt-4o", messages=messages)
+        except Exception as e:
+            logger.debug(f"litellm token_counter failed, using heuristic: {e}")
+    total = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            total += len(content) // 4
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    total += len(block.get("text", "")) // 4
+                else:
+                    total += 400  # rough cost of an image block
+    return total
+
+
 async def generate_direct_completion(prompt: str) -> str:
     """Direct single-turn LLM completion helper for context compaction."""
     messages = [

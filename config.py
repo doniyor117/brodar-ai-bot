@@ -41,6 +41,19 @@ FORCE_LOWERCASE = os.getenv("FORCE_LOWERCASE", "true").strip().lower() in ("1", 
 # a chat. This is the per-chat default; each chat can override it with /toggle_tools.
 SHOW_TOOL_NOTES_DEFAULT = os.getenv("SHOW_TOOL_NOTES", "true").strip().lower() in ("1", "true", "yes", "on")
 
+# Conversation history / auto-compaction.
+# How many messages to keep in the working window (hard safety cap). Token-based
+# compaction normally kicks in first for heavy chats.
+HISTORY_MAXLEN = int(os.getenv("HISTORY_MAXLEN", "250"))
+# When the context exceeds this many tokens, older messages are summarized into a
+# checkpoint and dropped, keeping the most recent ones verbatim.
+COMPACT_TOKEN_THRESHOLD = int(os.getenv("COMPACT_TOKEN_THRESHOLD", "100000"))
+# How many tokens' worth of the most recent messages to keep verbatim after a
+# compaction (the rest get folded into the running summary).
+COMPACT_KEEP_TOKENS = int(os.getenv("COMPACT_KEEP_TOKENS", "30000"))
+# Never keep fewer than this many recent messages after compaction.
+COMPACT_MIN_KEEP_MESSAGES = int(os.getenv("COMPACT_MIN_KEEP_MESSAGES", "8"))
+
 # Database configurations
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 

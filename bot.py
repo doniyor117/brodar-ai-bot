@@ -94,6 +94,17 @@ router.message.outer_middleware(AccessControlMiddleware())
 # Global cache for the bot's own username to prevent redundant API calls
 BOT_USERNAME = None
 
+# Strong refs to background maintenance tasks (auto-compaction) so the GC can't
+# cancel them mid-run.
+_maintenance_tasks: set = set()
+
+
+def _spawn_maintenance(coro) -> None:
+    """Fire-and-forget a background maintenance task, keeping a strong reference."""
+    task = asyncio.create_task(coro)
+    _maintenance_tasks.add(task)
+    task.add_done_callback(_maintenance_tasks.discard)
+
 async def init_bot_info(bot: Bot):
     """Caches the bot's username on startup."""
     global BOT_USERNAME
@@ -883,6 +894,11 @@ async def handle_chat_message(message: Message, bot: Bot):
 
         await send_long_reply(message, bot_reply)
 
+        # After replying, check if the context grew past the token threshold and
+        # compact in the background (it makes its own LLM call — don't block).
+        import session_manager
+        _spawn_maintenance(session_manager.maybe_auto_compact(chat_id))
+
     except asyncio.CancelledError:
         logger.info(f"Task execution for chat {chat_id} was cancelled by emergency stop.")
         raise
@@ -917,3 +933,7 @@ async def handle_group_passive(message: Message, bot: Bot):
     # store this message attributed to its speaker.
     await cache.get_chat_history(chat_id)
     cache.save_messages_async(chat_id, [{"role": "user", "content": _attribute(message, text)}])
+
+    # Keep group context from growing unbounded.
+    import session_manager
+    _spawn_maintenance(session_manager.maybe_auto_compact(chat_id))

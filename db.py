@@ -272,6 +272,34 @@ async def clear_chat_history(chat_id: int) -> None:
         await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
 
 
+async def delete_old_messages(chat_id: int, keep_last_n: int) -> int:
+    """
+    Deletes all but the newest `keep_last_n` messages for a chat (used by
+    compaction after the older messages have been folded into a summary).
+    Returns the number of rows deleted.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM messages
+            WHERE chat_id = $1
+              AND id NOT IN (
+                  SELECT id FROM messages
+                  WHERE chat_id = $1
+                  ORDER BY id DESC
+                  LIMIT $2
+              )
+            """,
+            chat_id, keep_last_n,
+        )
+        # asyncpg returns a status string like "DELETE 42"
+        try:
+            return int(result.split()[-1])
+        except Exception:
+            return 0
+
+
 async def clear_session_summaries(chat_id: int) -> None:
     """
     Deletes summary checkpoints for every session of a chat.
