@@ -126,3 +126,53 @@ def save_messages_async(chat_id: int, messages: List[Dict[str, str]]) -> None:
     # 2. Trigger Async DB Write
     task = asyncio.create_task(db.save_messages_batch(chat_id, messages))
     task.add_done_callback(_handle_db_write_error)
+
+async def clear_chat_history(chat_id: int) -> None:
+    """Clears conversation history from in-memory cache and triggers background DB deletion."""
+    if chat_id in _history_cache:
+        _history_cache[chat_id].clear()
+
+    task = asyncio.create_task(db.clear_chat_history(chat_id))
+    task.add_done_callback(_handle_db_write_error)
+
+# Set of allowed user IDs (combining env config and DB)
+_allowed_users_cache: Optional[set] = None
+
+async def is_user_allowed(user_id: int) -> bool:
+    """
+    Checks if a user ID is allowed for DMs and activation commands.
+    Loads from env and DB on cache miss.
+    """
+    global _allowed_users_cache
+    if _allowed_users_cache is None:
+        import config
+        _allowed_users_cache = set(config.ALLOWED_DM_USER_IDS)
+        try:
+            db_users = await db.fetch_allowed_users()
+            _allowed_users_cache.update(db_users)
+        except Exception as e:
+            logger.error(f"Failed to fetch allowed users from DB: {e}")
+
+    return user_id in _allowed_users_cache
+
+def add_allowed_user(user_id: int) -> None:
+    """Adds a user ID to the allowed cache and triggers DB write."""
+    global _allowed_users_cache
+    import config
+    if _allowed_users_cache is not None:
+        _allowed_users_cache.add(user_id)
+    else:
+        _allowed_users_cache = set(config.ALLOWED_DM_USER_IDS) | {user_id}
+
+    task = asyncio.create_task(db.add_allowed_user(user_id))
+    task.add_done_callback(_handle_db_write_error)
+
+def remove_allowed_user(user_id: int) -> None:
+    """Removes a user ID from the allowed cache and triggers DB deletion."""
+    global _allowed_users_cache
+    if _allowed_users_cache is not None:
+        _allowed_users_cache.discard(user_id)
+
+    task = asyncio.create_task(db.remove_allowed_user(user_id))
+    task.add_done_callback(_handle_db_write_error)
+

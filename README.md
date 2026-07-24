@@ -16,24 +16,30 @@ A group-chat capable Telegram AI Bot with tool-calling capabilities (web search,
 
 ## 1. Project Directory Structure
 ```text
-telegram_bot/
-├── config.py          # Configuration loader & validator
-├── db.py              # asyncpg database connection & operations
-├── cache.py           # In-memory write-through caching layer
-├── tools.py           # Core agent tools (DuckDuckGo search & safe subprocess runner)
-├── agent.py           # LLM client, prompt templates & tool-calling agent loop
-├── bot.py             # aiogram filters, commands, and chat handlers
-├── main.py            # FastAPI entry point, lifespan hooks, and webhook routes
-├── requirements.txt   # Pinned Python package dependencies
-├── .env.example       # Example environment configuration file
-├── render.yaml        # Render Blueprint deployment definition
-└── README.md          # Technical documentation (this file)
+brodar-ai-bot/
+├── MEMORY.md               # Persistent memory file storing persona, facts, and learned rules
+├── skills/                 # Hermes-style SKILL.md instruction directory
+│   ├── jailbreak_roast/    # Skill for playful jailbreak defense & roasting
+│   ├── system_diagnostics/ # Skill for server diagnostics & monitoring
+│   └── web_research/       # Skill for real-time web research
+├── skills.py               # Dynamic SKILL.md loader & parser
+├── memory.py               # MEMORY.md & Neon DB memory manager
+├── config.py               # Configuration loader & validator
+├── db.py                   # asyncpg database connection pooler & CRUD
+├── cache.py                # In-memory write-through caching layer
+├── tools.py                # Whitelisted command runner (ping, uptime, df, whoami, date, uname, free, ps, git, curl) & DDGS search
+├── agent.py                # LLM agent loop, MEMORY.md injection, & tool routing
+├── bot.py                  # aiogram AccessControlMiddleware, filters, & command handlers
+├── main.py                 # FastAPI entry point & webhook endpoints
+├── requirements.txt        # Python package dependencies
+├── .env.example            # Environment configuration template
+└── README.md               # Technical documentation
 ```
 
 ---
 
 ## 2. Neon Postgres Database Setup & Schema
-To keep the bot lightweight and efficient, we use **raw SQL migrations** via the Neon console or any SQL editor. This avoids adding the overhead of SQLAlchemy and running automated migration checks on boot (which would wake up Neon unnecessarily, wasting free-tier Compute Hours).
+To keep the bot lightweight and efficient, we use **raw SQL migrations** via the Neon console or any SQL editor.
 
 ### Migration SQL
 Log in to your [Neon Console](https://console.neon.tech/), select your database, open the **SQL Editor**, and run the following statements:
@@ -46,7 +52,13 @@ CREATE TABLE IF NOT EXISTS chats (
     is_active BOOLEAN DEFAULT FALSE NOT NULL
 );
 
--- 2. Create the Messages table for long-term chat histories
+-- 2. Create the Allowed Users table for dynamic DM access control
+CREATE TABLE IF NOT EXISTS allowed_users (
+    user_id BIGINT PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+-- 3. Create the Messages table for long-term chat histories
 CREATE TABLE IF NOT EXISTS messages (
     id SERIAL PRIMARY KEY,
     chat_id BIGINT NOT NULL,
@@ -55,7 +67,7 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
--- 3. Create an index to optimize chronological history retrieval
+-- 4. Create an index to optimize chronological history retrieval
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at 
 ON messages (chat_id, created_at DESC);
 ```
@@ -160,11 +172,47 @@ The Z.ai free tier rate limits request concurrency to 1. To prevent `429` (Too M
 
 ## 7. Changelog
 
+### Neon-Backed Memory Persistence, Global Abort & Interactive Permission Prompts (2026-07-24)
+* **Neon Postgres Memory Persistence (`memory_store`)**: `MEMORY.md` is now stored persistently in Neon Postgres. Automatically synced to local disk on app startup and updated via async write-through on every memory change, guaranteeing **100% memory persistence across Render container redeploys and restarts**.
+* **Global Emergency Abort (`/stop_all`, `/cancel_all`)**: Immediately halts all running agent tasks, LLM completions, and tool loops across **all chats globally**. Restricted to authorized bot admins.
+* **Group Admin Role Promotion & Demotion (`/promote`, `/demote`)**: Allows promoting members to Group Administrator (via `aiogram 3` `promote_chat_member`) or demoting them back to regular members. Exposed as commands and LLM tool actions.
+* **Telegram Interactive Permission Prompt System ([permissions.py](file:///mnt/projects/brodar-ai-bot/permissions.py))**: Non-whitelisted commands or `.env` file read attempts send an **Inline Keyboard message** with `[ ✅ Approve ]` and `[ ❌ Reject ]` buttons. Restricted to Group Admins in group chats with non-admin toast alerts.
+* **Terminal Read Tool Whitelist & `.env` Protection**: Safe diagnostic reading commands (`ls`, `cat`, `grep`, `head`, `tail`, `find`, `df`, `free`, `uptime`, `ps`, `whoami`, `date`, `uname`, `git status`, `git log`, `git diff`) run automatically. Any attempt to read `.env` or `.env.*` files triggers an interactive Permission Prompt.
+* **Agent Self-Management Tools**: Brodar can create/update skill files in `skills/` (`manage_skill_file`) and rewrite persona rules in `MEMORY.md` (`edit_memory_file`).
+
+### Hermes Sessions, Compaction, Skill Hub & Emergency Abort (2026-07-24)
+
+* **Emergency Abort Kill Switch (`/stop`, `/cancel`)**: Immediately halts active LLM generation or multi-step tool loops for the chat using `asyncio.Task` cancellation.
+* **Persistent Sessions & Context Compaction (`/compress`)**:
+  - `/new [title]` / `/reset`: Starts a fresh session.
+  - `/sessions` & `/switch_session <id>`: Lists and switches active sessions.
+  - `/compress`: LLM context compaction algorithm that summarizes older conversation context into a checkpoint while retaining the last 12 messages in full detail.
+* **Hermes Skill Hub & External Skill Manager**:
+  - `/install_skill <url>`: Installs external `SKILL.md` files from raw URLs or GitHub repos into `skills/<name>/SKILL.md`.
+  - `/enable_skill <name>`, `/disable_skill <name>`, `/uninstall_skill <name>`.
+* **Group Moderation System (`skills/group_admin/SKILL.md`)**:
+  - Commands `/ban`, `/mute`, `/unban`, `/unmute`, `/set_title` strictly guarded by `is_sender_admin` verification.
+  - Introduced `group_tools.py` and `group_moderation_tool` schema for LLM tool execution.
+
+### Hermes-Style SKILL.md System, MEMORY.md & Dynamic DM Access (2026-07-24)
+* **Root MEMORY.md System**: Persistent `MEMORY.md` file introduced to define identity, style guidelines (casual, lowercase, witty, jailbreak roasting), user facts, and learned rules. Automatically injected into LLM system prompt on boot.
+* **Hermes-Style SKILL.md System**: Created `skills/` directory with `SKILL.md` instruction files (`jailbreak_roast`, `system_diagnostics`, `web_research`). Introduced `skills.py` loader module and LLM tool `use_skill(skill_name)`.
+* **Dynamic DM User Allowlist**: Added `/allow_user <user_id>` and `/disallow_user <user_id>` commands for authorized administrators. Added `allowed_users` table to Postgres for persistence across restarts.
+
+* **Management Commands Added**:
+  - `/status`: Uptime, RAM usage, model name, active status.
+  - `/clear`: Resets chat context and history.
+  - `/skills`: Lists available skill instruction files.
+  - `/memory`: Displays `MEMORY.md` contents.
+  - `/allow_user` / `/disallow_user`: Dynamically grant/revoke DM access.
+* **Expanded Command Whitelist**: Added `free`, `ps`, `git`, and `curl` to safe shell executor whitelist.
+
 ### DM Access Control & Group Chat Opt-in (2026-07-24)
 * **DM Access Control (Allowlist Only)**: The bot is updated to only respond in private/DM chats to specific user IDs (`2030903420`, `8116285130`). DMs from any other users are silently ignored. Configured via the `ALLOWED_DM_USER_IDS` environment variable.
 * **Group Opt-in Model**: The bot will no longer respond in group chats by default. It must be explicitly activated in each group chat first using the `/activate` command.
 * **Commands**:
   * `/activate` (restricted to allowed user IDs): Activates the bot in a group chat.
   * `/deactivate` (restricted to allowed user IDs): Deactivates the bot in a group chat (silences all responses).
+
 * **Database Updates**: Added the `is_active` boolean column to the `chats` table, defaulting to `FALSE`. Added a migration script segment and updated the cache mechanism to support write-through caching of the active status.
 

@@ -65,6 +65,10 @@ To run or deploy the bot, you need to perform the following steps:
     -- To migrate an existing chats table:
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE NOT NULL;
 
+    CREATE TABLE IF NOT EXISTS allowed_users (
+        user_id BIGINT PRIMARY KEY,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+    );
 
    CREATE TABLE IF NOT EXISTS messages (
        id SERIAL PRIMARY KEY,
@@ -84,11 +88,12 @@ To run or deploy the bot, you need to perform the following steps:
 
 ---
 
-## 5. Security and Access Control Updates (2026-07-24)
+## 5. Security, Memory & Skills Updates (2026-07-24)
 
-1. **DM Access Allowlist**: Implemented user ID allowlist verification in DM chats (`ALLOWED_DM_USER_IDS` in `.env`). Unauthorized users are silently ignored.
-2. **Group Chat Opt-in**: The bot defaults to inactive (`is_active = FALSE`) for new group chats.
-3. **Commands Added**:
-   - `/activate`: Allowed users can activate a group chat.
-   - `/deactivate`: Allowed users can deactivate a group chat.
+1. **Root MEMORY.md Integration**: Persistent memory file storing identity, casual lowercase style guidelines, jailbreak roasting rules, and creator facts (`Doniyor`). Automatically injected into LLM context.
+2. **Hermes-Style SKILL.md System**: Created `skills/` directory with `SKILL.md` instruction files (`jailbreak_roast`, `system_diagnostics`, `web_research`), parsed via `skills.py`. Exposed `use_skill(skill_name)` tool call to the agent loop.
+3. **Dynamic DM Access Control**: Added `/allow_user <user_id>` and `/disallow_user <user_id>` commands for authorized administrators, backed by a persistent `allowed_users` table in Neon Postgres.
+4. **Essential Commands Added**: `/status`, `/clear`, `/skills`, `/memory`, `/allow_user`, `/disallow_user`, `/activate`, `/deactivate`, `/toggle_reply`.
+5. **Expanded Whitelisted Tools**: Enabled `free`, `ps`, `git`, `curl` with regex parameter validation in `tools.py`.
+
 

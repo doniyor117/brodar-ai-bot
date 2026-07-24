@@ -23,35 +23,91 @@ except ImportError:
 ALLOWED_COMMANDS = {
     "ping": {
         "bin": "ping",
-        "args_regex": r"^-[c]\s+[1-3]\s+[a-zA-Z0-9.-]+$", # Only allow e.g., -c 1 google.com
-        "description": "Pings a host. Arguments must match: -c [1-3] [host]"
+        "args_regex": r"^-[c]\s+[1-3]\s+[a-zA-Z0-9.-]+$",
+        "description": "Pings a host."
     },
     "uptime": {
         "bin": "uptime",
-        "args_regex": r"^$", # No arguments allowed
-        "description": "Shows system uptime. No arguments allowed."
+        "args_regex": r"^$",
+        "description": "Shows system uptime."
     },
     "df": {
         "bin": "df",
-        "args_regex": r"^$|^-[hT]$", # No arguments or simple flags
-        "description": "Shows disk space usage. Arguments allowed: none, -h, -T"
+        "args_regex": r"^$|^-[hT]$",
+        "description": "Shows disk space usage."
     },
     "whoami": {
         "bin": "whoami",
-        "args_regex": r"^$", # No arguments allowed
-        "description": "Shows current user. No arguments allowed."
+        "args_regex": r"^$",
+        "description": "Shows current user."
     },
     "date": {
         "bin": "date",
-        "args_regex": r"^$|^-[u]$", # No arguments or -u for UTC
-        "description": "Shows current date and time. Arguments allowed: none, -u"
+        "args_regex": r"^$|^-[u]$",
+        "description": "Shows current date and time."
     },
     "uname": {
         "bin": "uname",
-        "args_regex": r"^$|^-[arsn]$", # No arguments or simple flags
-        "description": "Shows system information. Arguments allowed: none, -a, -r, -s, -n"
+        "args_regex": r"^$|^-[arsn]$",
+        "description": "Shows system info."
+    },
+    "free": {
+        "bin": "free",
+        "args_regex": r"^$|^-[h]$",
+        "description": "Shows RAM usage."
+    },
+    "ps": {
+        "bin": "ps",
+        "args_regex": r"^$|^aux$|^aux\s+--sort=-%cpu$",
+        "description": "Shows process status."
+    },
+    "git": {
+        "bin": "git",
+        "args_regex": r"^(status|log(\s+-n\s+[1-5])?|branch|diff)$",
+        "description": "Shows git status, diff, or log."
+    },
+    "curl": {
+        "bin": "curl",
+        "args_regex": r"^-[I]\s+https://[a-zA-Z0-9.-]+$",
+        "description": "Fetches HTTP headers for safe domains."
+    },
+    "ls": {
+        "bin": "ls",
+        "args_regex": r"^$|^-[la1h]+(\s+[a-zA-Z0-9_./-]+)?$",
+        "description": "Lists directory contents."
+    },
+    "cat": {
+        "bin": "cat",
+        "args_regex": r"^[a-zA-Z0-9_./-]+$",
+        "description": "Displays file content."
+    },
+    "head": {
+        "bin": "head",
+        "args_regex": r"^$|^(-n\s+[0-9]+\s+)?[a-zA-Z0-9_./-]+$",
+        "description": "Displays top lines of a file."
+    },
+    "tail": {
+        "bin": "tail",
+        "args_regex": r"^$|^(-n\s+[0-9]+\s+)?[a-zA-Z0-9_./-]+$",
+        "description": "Displays end lines of a file."
+    },
+    "grep": {
+        "bin": "grep",
+        "args_regex": r"^-[irn]+\s+['\"][a-zA-Z0-9_.-]+['\"]\s+[a-zA-Z0-9_./-]+$|^[a-zA-Z0-9_.-]+\s+[a-zA-Z0-9_./-]+$",
+        "description": "Searches pattern in file."
+    },
+    "find": {
+        "bin": "find",
+        "args_regex": r"^\.\s+-name\s+['\"][a-zA-Z0-9_*.-]+['\"]$",
+        "description": "Finds files by name."
     }
 }
+
+def is_env_access_attempt(command: str, args_str: str) -> bool:
+    """Checks if a command or arguments attempt to read or access .env files."""
+    text = f"{command} {args_str}".lower()
+    return ".env" in text or "env." in text or "/env" in text
+
 
 def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
     """

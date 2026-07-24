@@ -29,6 +29,35 @@ dp = Dispatcher()
 # Register bot handlers router
 dp.include_router(bot_module.router)
 
+import asyncio
+import httpx
+
+async def _keep_alive_loop():
+    """
+    Background keep-alive loop that periodically pings WEBHOOK_URL/health
+    every 10 minutes (600 seconds) via HTTP request through Render's edge proxy
+    to prevent the container from spinning down on Render free tier.
+    """
+    if not config.WEBHOOK_URL or "CHANGE_ME" in config.WEBHOOK_URL:
+        logger.info("WEBHOOK_URL is not configured with a valid domain. Self keep-alive loop disabled.")
+        return
+
+    health_url = f"{config.WEBHOOK_URL.rstrip('/')}/health"
+    logger.info(f"Starting background keep-alive ping loop targeting {health_url} (every 10m)...")
+
+    # Initial delay before first ping
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get(health_url)
+                logger.info(f"Keep-alive ping to {health_url} returned HTTP status {res.status_code}")
+        except Exception as e:
+            logger.warning(f"Keep-alive ping failed: {e}")
+
+        await asyncio.sleep(600)  # Ping every 10 minutes
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI Lifespan event manager handling startup and shutdown."""
@@ -39,10 +68,13 @@ async def lifespan(app: FastAPI):
     if config.DATABASE_URL:
         try:
             await db.init_db_pool()
+            import memory
+            await memory.sync_memory_from_db()
         except Exception as e:
             logger.error(f"Failed to initialize database pool during startup: {e}")
     else:
         logger.warning("DATABASE_URL is not set. Database operations will be bypassed.")
+
 
     # Initialize bot details (caches bot username)
     await bot_module.init_bot_info(bot)
@@ -64,25 +96,31 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("WEBHOOK_URL is not set. Webhook registration skipped.")
 
-    yield # Running app
+    # Launch background keep-alive ping loop
+    keep_alive_task = asyncio.create_task(_keep_alive_loop())
 
-    # 2. Shutdown Logic
-    logger.info("Shutting down Telegram AI Bot Service...")
-    
-    # Remove Telegram Webhook (optional but recommended for clean stop)
     try:
-        logger.info("Deleting Telegram webhook...")
-        await bot.delete_webhook()
-    except Exception as e:
-        logger.error(f"Failed to delete Telegram webhook: {e}")
+        yield # Running app
+    finally:
+        # 2. Shutdown Logic
+        logger.info("Shutting down Telegram AI Bot Service...")
+        keep_alive_task.cancel()
 
-    # Close aiogram bot session
-    logger.info("Closing bot session...")
-    await bot.session.close()
+        # Remove Telegram Webhook
+        try:
+            logger.info("Deleting Telegram webhook...")
+            await bot.delete_webhook()
+        except Exception as e:
+            logger.error(f"Failed to delete Telegram webhook: {e}")
 
-    # Close the database pool
-    await db.close_db_pool()
-    logger.info("Shutdown process complete.")
+        # Close aiogram bot session
+        logger.info("Closing bot session...")
+        await bot.session.close()
+
+        # Close database connection pool
+        await db.close_db_pool()
+        logger.info("Shutdown process complete.")
+
 
 # Initialize FastAPI App
 app = FastAPI(
