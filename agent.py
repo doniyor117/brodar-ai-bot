@@ -7,21 +7,28 @@ import config
 import tools
 import memory
 import skills
+import models
+import cache
 
 logger = logging.getLogger(__name__)
 
-# Fallback-safe import for zai
-ZAI_AVAILABLE = False
+# LiteLLM gives one unified async interface across every provider (Gemini, GLM via
+# Z.ai's OpenAI-compatible endpoint, etc.) and normalizes tool-calling and vision.
+LITELLM_AVAILABLE = False
 try:
-    from zai import ZaiClient
-    ZAI_AVAILABLE = True
+    import litellm
+    from litellm import acompletion
+    # Drop provider-unsupported params (e.g. top_p on some models) instead of erroring.
+    litellm.drop_params = True
+    LITELLM_AVAILABLE = True
 except ImportError:
-    ZaiClient = None
-    logger.warning("zai-sdk is not installed. LLM completions will fail.")
+    litellm = None
+    acompletion = None
+    logger.warning("litellm is not installed. LLM completions will fail.")
 
-# Concurrency guard for Z.ai. This wraps ONLY the network call to the model, not
-# the surrounding tool loop — so a slow tool or a 120s permission prompt in one
-# chat can no longer freeze every other chat. Configurable via LLM_CONCURRENCY.
+# Concurrency guard. This wraps ONLY the network call to the model, not the
+# surrounding tool loop — so a slow tool or a 120s permission prompt in one chat
+# can no longer freeze every other chat. Configurable via LLM_CONCURRENCY.
 _concurrency_semaphore = asyncio.Semaphore(max(1, config.LLM_CONCURRENCY))
 
 # Active agent tasks per chat_id for emergency stop support. A chat can have more
@@ -235,56 +242,57 @@ TOOLS_SCHEMA = [
     }
 ]
 
-def _get_client() -> ZaiClient:
-    """Initializes and returns the ZaiClient."""
-    if not ZAI_AVAILABLE or ZaiClient is None:
-        raise RuntimeError("zai-sdk is not installed or import failed.")
-    if not config.ZAI_API_KEY:
-        raise ValueError("ZAI_API_KEY environment variable is not set.")
-    return ZaiClient(api_key=config.ZAI_API_KEY)
-
 async def _call_llm_with_retry(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
     temperature: float = 0.7,
+    spec: Optional["models.ModelSpec"] = None,
 ) -> Any:
     """
-    Calls the Z.ai API client in a separate thread with exponential backoff for rate limits.
+    Calls the given model via LiteLLM with exponential backoff on rate limits.
+    Returns an OpenAI-style response (response.choices[0].message ...).
     """
-    client = _get_client()
+    if not LITELLM_AVAILABLE or acompletion is None:
+        raise RuntimeError("litellm is not installed or import failed.")
+
+    if spec is None:
+        spec = models.resolve_spec(await cache.get_active_model())
+    if not spec.is_available:
+        raise ValueError(
+            f"Model '{spec.key}' selected but its API key ({spec.api_key_env}) is not set."
+        )
+
     max_retries = 5
     base_delay = 1.5
 
     for attempt in range(max_retries):
         try:
-            kwargs = {
-                "model": config.MODEL_NAME,
-                "messages": messages,
-                "temperature": temperature,
-                "top_p": 1.0,
-            }
+            kwargs = dict(spec.call_kwargs())
+            kwargs.update({"messages": messages, "temperature": temperature})
             if tools:
                 kwargs["tools"] = tools
 
-            logger.info(f"Calling LLM completion (attempt {attempt + 1})...")
+            logger.info(f"Calling model '{spec.key}' ({spec.litellm_model}), attempt {attempt + 1}...")
             # Hold the concurrency guard only for the actual network call.
             async with _concurrency_semaphore:
-                response = await asyncio.to_thread(client.chat.completions.create, **kwargs)
+                response = await acompletion(**kwargs)
             return response
 
         except Exception as e:
             err_msg = str(e)
-            logger.warning(f"Zai API call failed (attempt {attempt + 1}): {err_msg}")
-            
+            logger.warning(f"LLM call to '{spec.key}' failed (attempt {attempt + 1}): {err_msg}")
+
+            low = err_msg.lower()
             is_rate_limit = (
-                "429" in err_msg or 
-                "1302" in err_msg or 
-                "1305" in err_msg or 
-                "rate limit" in err_msg.lower() or
-                "throttling" in err_msg.lower() or
-                "too many requests" in err_msg.lower()
+                "429" in err_msg or
+                "rate limit" in low or
+                "ratelimit" in low or
+                "throttl" in low or
+                "too many requests" in low or
+                "resource_exhausted" in low or
+                "quota" in low
             )
-            
+
             if is_rate_limit and attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt) + random.uniform(0.1, 0.5)
                 logger.info(f"Rate limit detected. Retrying in {delay:.2f} seconds...")
@@ -333,12 +341,32 @@ async def _notify(bot_instance: Optional[Any], chat_id: Optional[int], text: str
         logger.warning(f"Failed to send tool-status note to chat {chat_id}: {e}")
 
 
+def _attach_images_to_last_user(full_messages: List[Dict[str, Any]], image_urls: List[str]) -> None:
+    """
+    Rewrites the last user message into OpenAI-style multimodal content blocks
+    (text + image_url), which LiteLLM forwards to vision models.
+    """
+    for msg in reversed(full_messages):
+        if msg.get("role") == "user":
+            text = msg.get("content") or ""
+            if isinstance(text, list):
+                return  # already multimodal
+            blocks: List[Dict[str, Any]] = []
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for url in image_urls:
+                blocks.append({"type": "image_url", "image_url": {"url": url}})
+            msg["content"] = blocks
+            return
+
+
 async def generate_response(
     chat_history: List[Dict[str, str]],
     bot_instance: Optional[Any] = None,
     chat_id: Optional[int] = None,
     requester_is_privileged: bool = False,
     show_tool_notes: bool = True,
+    image_urls: Optional[List[str]] = None,
 ) -> str:
     """
     Generates a response from the AI Agent bot.
@@ -350,7 +378,14 @@ async def generate_response(
 
     `requester_is_privileged` gates state-mutating tools (persona/skill edits and
     group moderation) to DM-allowlisted users and group admins.
+
+    `image_urls` are data: URLs for attached images; they are only sent to the
+    model if the active model supports vision, otherwise they're dropped and the
+    model is told it can't see images.
     """
+    # Resolve the active model once for this whole turn.
+    spec = models.resolve_spec(await cache.get_active_model())
+
     # Persona (fixed, code-owned) + learned facts (mutable) + skills.
     persona = memory.read_persona()
     learned_facts = memory.read_memory_md()
@@ -392,10 +427,25 @@ async def generate_response(
     full_messages.extend(FEW_SHOTS)
     full_messages.extend(chat_history)
 
+    # Attach images to the latest user turn — but only if the active model can
+    # actually see them. Otherwise let the model know so it doesn't pretend.
+    if image_urls:
+        if spec.supports_vision:
+            _attach_images_to_last_user(full_messages, image_urls)
+        else:
+            full_messages.append({
+                "role": "system",
+                "content": (
+                    f"the user sent {len(image_urls)} image(s), but the current model "
+                    f"({spec.label}) can't see images. tell them to switch to a vision "
+                    "model with /model if they want you to look."
+                ),
+            })
+
     max_tool_loops = 6
 
     for loop_idx in range(max_tool_loops):
-        response = await _call_llm_with_retry(full_messages, tools=TOOLS_SCHEMA)
+        response = await _call_llm_with_retry(full_messages, tools=TOOLS_SCHEMA, spec=spec)
 
         if not response or not response.choices:
             return "uh, something went wrong. my brain feels empty."
@@ -543,7 +593,7 @@ async def generate_response(
                        "casual lowercase voice using whatever you've already found. if you "
                        "couldn't get what they wanted, just say so briefly.",
         })
-        final = await _call_llm_with_retry(full_messages, tools=None)
+        final = await _call_llm_with_retry(full_messages, tools=None, spec=spec)
         if final and final.choices:
             content = final.choices[0].message.content
             if content:

@@ -1,19 +1,44 @@
+import io
+import base64
 import logging
 import asyncio
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.filters import Command, BaseFilter
-from aiogram.types import Message, TelegramObject, CallbackQuery
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import (
+    Message, TelegramObject, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
 from aiogram.utils.chat_action import ChatActionSender
 
 import config
 import cache
 import agent
+import models
 import permissions
 
 logger = logging.getLogger(__name__)
 
 # Router for all bot handlers
 router = Router()
+
+
+class ModelCallback(CallbackData, prefix="model"):
+    """Inline-button payload for the /model picker."""
+    key: str
+
+
+def _build_model_keyboard(current_key: str) -> InlineKeyboardMarkup:
+    """Inline keyboard listing every registered model, ticking the active one."""
+    rows = []
+    for spec in models.all_models():
+        tick = "✅ " if spec.key == current_key else ""
+        lock = "" if spec.is_available else " 🔒"
+        rows.append([InlineKeyboardButton(
+            text=f"{tick}{spec.label}{lock}",
+            callback_data=ModelCallback(key=spec.key).pack(),
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 class AccessControlMiddleware(BaseMiddleware):
     """
@@ -216,7 +241,8 @@ async def cmd_help(message: Message):
         "- /allow_user <id> (authorized users): grant DM access to a user.\n"
         "- /disallow_user <id> (authorized users): revoke DM access.\n"
         "- /toggle_reply (group admins): toggle mention-only vs reply-all mode.\n"
-        "- /toggle_tools (admins): show or hide the tool-activity clues."
+        "- /toggle_tools (admins): show or hide the tool-activity clues.\n"
+        "- /model (admins): switch the ai model (some can see images)."
     )
     await message.reply(text)
 
@@ -248,6 +274,55 @@ async def cmd_toggle_tools(message: Message, bot: Bot):
         await message.reply("tool clues hidden. i'll work quietly from now on.")
     else:
         await message.reply("tool clues on. i'll show you what i'm doing (🔍 ⚙️ 🧠).")
+
+
+@router.message(Command("model"))
+async def cmd_model(message: Message, bot: Bot):
+    """Shows an inline picker to switch the global active model."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can change the model.")
+        return
+    current = await cache.get_active_model()
+    spec = models.get_spec(current)
+    label = spec.label if spec else current
+    await message.reply(
+        f"current model: {label}\n\npick one below. 🔒 = api key not set yet.",
+        reply_markup=_build_model_keyboard(current),
+    )
+
+
+@router.callback_query(ModelCallback.filter())
+async def handle_model_callback(callback: CallbackQuery, callback_data: ModelCallback, bot: Bot):
+    """Applies a model selection from the /model inline keyboard."""
+    if not callback.message:
+        await callback.answer("this picker expired.", show_alert=True)
+        return
+    # Authorize the actual clicker (callback.from_user), not the message author
+    # (which is the bot). DM-allowlisted users anywhere, or group admins.
+    clicker = callback.from_user
+    allowed = await cache.is_user_allowed(clicker.id)
+    if not allowed and callback.message.chat.type != "private":
+        allowed = await is_sender_admin(callback.message, bot, user_id=clicker.id)
+    if not allowed:
+        await callback.answer("only authorized admins can change the model.", show_alert=True)
+        return
+
+    spec = models.get_spec(callback_data.key)
+    if not spec:
+        await callback.answer("unknown model.", show_alert=True)
+        return
+
+    cache.set_active_model(spec.key)
+    await callback.answer(f"switched to {spec.label}")
+    note = "" if spec.is_available else f"\n\n⚠️ heads up: {spec.api_key_env} isn't set, so this will fail until you add it."
+    vision = " it can see images now." if spec.supports_vision else " (text only — it can't see images.)"
+    try:
+        await callback.message.edit_text(
+            f"model set to: {spec.label}.{vision}{note}",
+            reply_markup=_build_model_keyboard(spec.key),
+        )
+    except Exception:
+        pass
 
 
 @router.message(Command("activate"))
@@ -303,6 +378,9 @@ async def cmd_status(message: Message):
     active = await cache.get_chat_active(chat_id) if message.chat.type != "private" else True
     mention_only = await cache.get_chat_setting(chat_id) if message.chat.type != "private" else False
     show_tool_notes = await cache.get_chat_tool_notes(chat_id)
+    active_model_key = await cache.get_active_model()
+    active_spec = models.get_spec(active_model_key)
+    model_label = active_spec.label if active_spec else active_model_key
 
     import tools
     # Run blocking subprocess calls off the event loop.
@@ -315,7 +393,7 @@ async def cmd_status(message: Message):
         f"- bot active: {active}\n"
         f"- mention only: {mention_only}\n"
         f"- tool clues: {show_tool_notes}\n"
-        f"- model: {config.MODEL_NAME}\n"
+        f"- model: {model_label}\n"
         f"- uptime: {uptime}\n"
         f"- ram: {ram}"
     )
@@ -681,6 +759,38 @@ async def cmd_set_title(message: Message, bot: Bot):
     res = await group_tools.set_group_title(bot, message.chat.id, new_title)
     await message.reply(res)
 
+MAX_IMAGE_BYTES = 4 * 1024 * 1024  # skip anything larger than 4MB
+
+
+async def _extract_image_data_urls(message: Message, bot: Bot) -> list:
+    """
+    Downloads any images attached to a message and returns them as base64 data URLs.
+    Handles photos and image documents. Only called when the active model has vision.
+    """
+    file_ids = []
+    if message.photo:
+        # message.photo is ascending sizes; take the largest.
+        file_ids.append((message.photo[-1].file_id, "image/jpeg"))
+    doc = message.document
+    if doc and (doc.mime_type or "").startswith("image/"):
+        file_ids.append((doc.file_id, doc.mime_type))
+
+    urls = []
+    for file_id, mime in file_ids:
+        try:
+            f = await bot.get_file(file_id)
+            if f.file_size and f.file_size > MAX_IMAGE_BYTES:
+                logger.info(f"Skipping image {file_id}: {f.file_size} bytes over limit.")
+                continue
+            buf = io.BytesIO()
+            await bot.download_file(f.file_path, destination=buf)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            urls.append(f"data:{mime or 'image/jpeg'};base64,{b64}")
+        except Exception as e:
+            logger.warning(f"Failed to download image {file_id}: {e}")
+    return urls
+
+
 @router.message(ShouldRespondFilter())
 async def handle_chat_message(message: Message, bot: Bot):
     """
@@ -699,7 +809,10 @@ async def handle_chat_message(message: Message, bot: Bot):
     if BOT_USERNAME:
         cleaned_text = raw_text.replace(f"@{BOT_USERNAME}", "").strip()
 
-    if not cleaned_text:
+    has_image = bool(message.photo or (message.document and (message.document.mime_type or "").startswith("image/")))
+
+    # Nothing to do if there's neither text nor an image.
+    if not cleaned_text and not has_image:
         return
 
     # Whether this sender may drive state-changing tools (persona/skill edits,
@@ -707,8 +820,18 @@ async def handle_chat_message(message: Message, bot: Bot):
     privileged = await is_user_privileged(message, bot)
     show_tool_notes = await cache.get_chat_tool_notes(chat_id)
 
+    # Only download images if the active model can actually see them.
+    image_urls = []
+    if has_image:
+        active_spec = models.resolve_spec(await cache.get_active_model())
+        if active_spec.supports_vision:
+            image_urls = await _extract_image_data_urls(message, bot)
+
+    # What we store/show as the user's text (images aren't persisted in history).
+    text_for_model = cleaned_text or ("[sent an image]" if has_image else "")
+
     history = await cache.get_chat_history(chat_id)
-    user_msg_entry = {"role": "user", "content": cleaned_text}
+    user_msg_entry = {"role": "user", "content": text_for_model}
     temp_history = history + [user_msg_entry]
 
     current_task = asyncio.current_task()
@@ -724,15 +847,17 @@ async def handle_chat_message(message: Message, bot: Bot):
                 chat_id=chat_id,
                 requester_is_privileged=privileged,
                 show_tool_notes=show_tool_notes,
+                image_urls=image_urls or None,
             )
 
         if config.FORCE_LOWERCASE:
             bot_reply = enforce_lowercase(bot_reply)
 
         # Persist BEFORE sending. If sending fails (e.g. formatting), the turn is
-        # still saved to history instead of being silently lost.
+        # still saved to history instead of being silently lost. Images aren't
+        # stored (they'd bloat history); a placeholder marks that one was sent.
         cache.save_messages_async(chat_id, [
-            {"role": "user", "content": cleaned_text},
+            {"role": "user", "content": text_for_model},
             {"role": "assistant", "content": bot_reply},
         ])
 

@@ -180,6 +180,30 @@ async def clear_chat_history(chat_id: int) -> None:
     # re-injected into the system prompt from the last compaction.
     _spawn_db_write(db.clear_session_summaries(chat_id))
 
+# Global active model key (persisted in memory_store under "active_model").
+_active_model_cache: Optional[str] = None
+
+async def get_active_model() -> str:
+    """Returns the globally selected model key, loading from DB on first call."""
+    global _active_model_cache
+    if _active_model_cache is not None:
+        return _active_model_cache
+
+    import config
+    stored = None
+    try:
+        stored = await db.fetch_stored_memory("active_model")
+    except Exception as e:
+        logger.error(f"Failed to fetch active model from DB: {e}")
+    _active_model_cache = stored or config.MODEL_NAME
+    return _active_model_cache
+
+def set_active_model(model_key: str) -> None:
+    """Sets the global active model and persists it."""
+    global _active_model_cache
+    _active_model_cache = model_key
+    _spawn_db_write(db.save_stored_memory(model_key, "active_model"))
+
 # Set of allowed user IDs (combining env config and DB)
 _allowed_users_cache: Optional[set] = None
 

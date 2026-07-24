@@ -11,10 +11,13 @@ services:
         description: "Your Telegram Bot API Token from @BotFather"
       - key: ZAI_API_KEY
         sync: false
-        description: "Your Zhipu AI (Z.ai) API Key"
+        description: "Your Zhipu AI (Z.ai) API Key (for GLM models)"
+      - key: GEMINI_API_KEY
+        sync: false
+        description: "Google AI Studio API key (for Gemini vision models)"
       - key: MODEL_NAME
         value: glm-4.7-flash
-        description: "Model to use for completion (default: glm-4.7-flash)"
+        description: "Default model key: glm-4.7-flash | gemini-3.5-flash-lite | gemini-3.1-flash-lite"
       - key: DATABASE_URL
         sync: false
         description: "Neon Postgres Connection String"

@@ -23,6 +23,10 @@ if _allowed_users_raw:
 
 # LLM configurations
 ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
+# Google AI Studio key for Gemini models (used via LiteLLM).
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Default active model — must be a key in models.MODELS. Can be changed at
+# runtime with /model; the choice is persisted globally.
 MODEL_NAME = os.getenv("MODEL_NAME", "glm-4.7-flash")
 
 # Number of LLM API calls allowed in flight at once. The Z.ai free tier is
@@ -86,8 +90,11 @@ def validate_config(exit_on_error: bool = True) -> list:
 
     if not TELEGRAM_BOT_TOKEN or is_placeholder(TELEGRAM_BOT_TOKEN):
         problems.append("TELEGRAM_BOT_TOKEN is missing or still a placeholder")
-    if not ZAI_API_KEY or is_placeholder(ZAI_API_KEY):
-        problems.append("ZAI_API_KEY is missing or still a placeholder")
+    # At least one model provider key must be set (GLM via Z.ai, or Gemini).
+    zai_ok = ZAI_API_KEY and not is_placeholder(ZAI_API_KEY)
+    gemini_ok = GEMINI_API_KEY and not is_placeholder(GEMINI_API_KEY)
+    if not zai_ok and not gemini_ok:
+        problems.append("No model API key set — provide ZAI_API_KEY and/or GEMINI_API_KEY")
     if not DATABASE_URL or is_placeholder(DATABASE_URL):
         problems.append("DATABASE_URL is missing or still a placeholder")
     if not webhook_url_is_usable():
