@@ -311,9 +311,25 @@ async def generate_response(chat_history: List[Dict[str, str]], bot_instance: Op
                 "content": message.content or None,
             }
             if hasattr(message, "tool_calls") and message.tool_calls:
-                assistant_msg["tool_calls"] = message.tool_calls
+                formatted_calls = []
+                for tc in message.tool_calls:
+                    fn_obj = getattr(tc, "function", None)
+                    fn_name = fn_obj.name if fn_obj and hasattr(fn_obj, "name") else ""
+                    fn_args = fn_obj.arguments if fn_obj and hasattr(fn_obj, "arguments") else ""
+                    if not isinstance(fn_args, str):
+                        fn_args = json.dumps(fn_args)
+                    formatted_calls.append({
+                        "id": getattr(tc, "id", f"call_{loop_idx}"),
+                        "type": "function",
+                        "function": {
+                            "name": fn_name,
+                            "arguments": fn_args
+                        }
+                    })
+                assistant_msg["tool_calls"] = formatted_calls
             
             full_messages.append(assistant_msg)
+
 
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name

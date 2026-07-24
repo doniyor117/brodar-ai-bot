@@ -32,29 +32,31 @@ class AccessControlMiddleware(BaseMiddleware):
         # 1. Private Chat Check (DMs)
         if chat_type == "private":
             if not user_id or not await cache.is_user_allowed(user_id):
-                logger.info(f"Ignoring DM from unauthorized user ID: {user_id}")
-                return  # silently ignore
+                logger.info(f"Access restricted for DM user ID: {user_id}")
+                await message.reply(f"access restricted. user ID {user_id} is not in the DM allowlist. ask an admin to run /allow_user {user_id}.")
+                return
             return await handler(event, data)
 
         # 2. Group Chat Check
         text = message.text or message.caption or ""
         cmd = text.strip().split()[0].lower() if text.strip() else ""
 
-        # Admin control commands allowed in inactive groups
-        admin_cmds = ["/activate", "/deactivate", "/allow_user", "/disallow_user"]
-        if any(cmd.startswith(c) for c in admin_cmds):
+        # Admin & system control commands allowed in inactive groups
+        allowed_group_cmds = ["/activate", "/deactivate", "/allow_user", "/disallow_user", "/start", "/help", "/status"]
+        if any(cmd.startswith(c) for c in allowed_group_cmds):
             if not user_id or not await cache.is_user_allowed(user_id):
                 logger.info(f"Ignoring admin command '{text}' from unauthorized user {user_id} in group {chat_id}")
-                return  # silently ignore
+                return
             return await handler(event, data)
 
         # For any other message/command in group chats, check if group is active
         is_active = await cache.get_chat_active(chat_id)
         if not is_active:
-            # Silently ignore all messages and commands in inactive group chats
+            # Silently ignore general chatter in inactive group chats until /activate
             return
 
         return await handler(event, data)
+
 
 # Register the outer middleware on the router
 router.message.outer_middleware(AccessControlMiddleware())

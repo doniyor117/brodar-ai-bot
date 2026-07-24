@@ -10,13 +10,14 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "super-secret-telegram-token")
 
 # Allowed users for DMs and activation
-_allowed_users_raw = os.getenv("ALLOWED_DM_USER_IDS", "")
+_allowed_users_raw = os.getenv("ALLOWED_DM_USER_IDS", "2030903420,8116285130")
 ALLOWED_DM_USER_IDS = []
 if _allowed_users_raw:
     try:
         ALLOWED_DM_USER_IDS = [int(uid.strip()) for uid in _allowed_users_raw.split(",") if uid.strip()]
     except ValueError as e:
         print(f"WARNING: Failed to parse ALLOWED_DM_USER_IDS: {e}")
+
 
 
 # LLM configurations
