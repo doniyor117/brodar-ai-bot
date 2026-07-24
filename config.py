@@ -57,7 +57,7 @@ COMPACT_MIN_KEEP_MESSAGES = int(os.getenv("COMPACT_MIN_KEEP_MESSAGES", "8"))
 # Visual memory: how many turns a sent image/GIF stays available to the model for
 # follow-up questions before it's dropped. 0 disables (send-once). Each retained
 # image is re-sent every turn in its window, so keep this modest for token cost.
-VISUAL_MEMORY_TURNS = int(os.getenv("VISUAL_MEMORY_TURNS", "3"))
+VISUAL_MEMORY_TURNS = int(os.getenv("VISUAL_MEMORY_TURNS", "5"))
 # Hard cap on how many images may be attached to a single request (safety).
 VISUAL_MEMORY_MAX_IMAGES = int(os.getenv("VISUAL_MEMORY_MAX_IMAGES", "5"))
 

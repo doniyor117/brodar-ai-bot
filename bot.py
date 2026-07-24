@@ -328,10 +328,9 @@ async def handle_model_callback(callback: CallbackQuery, callback_data: ModelCal
     note = "" if spec.is_available else f"\n\n⚠️ heads up: {spec.api_key_env} isn't set, so this will fail until you add it."
     vision = " it can see images now." if spec.supports_vision else " (text only — it can't see images.)"
     try:
-        await callback.message.edit_text(
-            f"model set to: {spec.label}.{vision}{note}",
-            reply_markup=_build_model_keyboard(spec.key),
-        )
+        # Drop the keyboard (reply_markup omitted) so the buttons disappear, and
+        # leave a body that states the selected model.
+        await callback.message.edit_text(f"✅ model set to: {spec.label}.{vision}{note}")
     except Exception:
         pass
 
