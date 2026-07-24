@@ -21,8 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Fails loudly (SystemExit) if credentials are missing or still placeholders.
-config.validate_config()
+# Log loudly if credentials are missing or still placeholders — but DO NOT exit.
+# Crashing here just crash-loops the whole app; instead we stay up (so /health
+# works and the webhook can be set/retried) and report problems in the logs.
+config.validate_config(exit_on_error=False)
 
 # Initialize Bot and Dispatcher.
 # parse_mode is deliberately None: model output is arbitrary text and would
@@ -84,8 +86,10 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up Telegram AI Bot Service...")
 
     # Initialize the Database connection pool and create the schema.
-    # A failure here is fatal: without the DB, group activation and history
-    # live only in process memory and are lost on every restart.
+    # If this fails we log CRITICAL but keep the app running: crashing here would
+    # take the whole bot offline (and, on free tier, leave it unwakeable). A
+    # degraded bot that still answers beats a crash-loop. Chat settings/history
+    # simply won't persist until the DB is reachable again.
     if config.DATABASE_URL:
         try:
             await db.init_db_pool()
@@ -94,10 +98,10 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.critical(
                 f"Failed to initialize the database during startup: {e}. "
-                "Chat settings and history CANNOT persist. Fix DATABASE_URL and redeploy.",
+                "Chat settings and history will NOT persist until DATABASE_URL works. "
+                "The bot will still run in a degraded (in-memory) mode.",
                 exc_info=True,
             )
-            raise
     else:
         logger.warning("DATABASE_URL is not set. Database operations will be bypassed.")
 
@@ -122,9 +126,9 @@ async def lifespan(app: FastAPI):
             if info.last_error_message:
                 logger.warning(f"Telegram reports a previous webhook error: {info.last_error_message}")
         except Exception as e:
-            # Without a webhook the bot receives nothing at all — never degrade silently.
+            # Log loudly but keep running. The app staying up means the webhook
+            # can still be (re)set out of band, and /health stays reachable.
             logger.critical(f"Failed to set Telegram webhook: {e}", exc_info=True)
-            raise
     else:
         logger.critical(
             f"WEBHOOK_URL is unusable (value: {config.WEBHOOK_URL or '<unset>'}). "
@@ -147,12 +151,14 @@ async def lifespan(app: FastAPI):
             logger.info(f"Waiting for {len(pending)} in-flight update(s) to finish...")
             await asyncio.wait(pending, timeout=10.0)
 
-        # Remove Telegram Webhook
-        try:
-            logger.info("Deleting Telegram webhook...")
-            await bot.delete_webhook()
-        except Exception as e:
-            logger.error(f"Failed to delete Telegram webhook: {e}")
+        # IMPORTANT: do NOT delete the webhook on shutdown.
+        # On Render's free tier the container sleeps when idle, which triggers
+        # this shutdown path. If we deleted the webhook here, Telegram would have
+        # nowhere to deliver updates, so no inbound request would ever arrive to
+        # wake the sleeping container — the bot would die permanently. Leaving the
+        # webhook registered means Telegram's own delivery attempts wake the app.
+        # The webhook is (re)set idempotently on startup, so it stays correct.
+        logger.info("Leaving Telegram webhook registered so the app can wake on delivery.")
 
         # Close aiogram bot session
         logger.info("Closing bot session...")

@@ -111,13 +111,19 @@ async def init_schema() -> None:
     """Creates every table and index the bot needs. Safe to run repeatedly."""
     pool = get_pool()
     async with pool.acquire() as conn:
+        failures = 0
         for statement in SCHEMA_STATEMENTS:
             try:
                 await conn.execute(statement)
             except Exception as e:
-                logger.error(f"Schema statement failed: {e}\nStatement: {statement.strip()[:120]}")
-                raise
-    logger.info("Database schema verified (chats, messages, allowed_users, sessions, summaries, memory_store).")
+                # Don't abort the whole schema over one statement — create what we
+                # can so the bot runs as much as possible, and surface the problem.
+                failures += 1
+                logger.error(f"Schema statement failed (continuing): {e}\nStatement: {statement.strip()[:120]}")
+    if failures:
+        logger.warning(f"Database schema verified with {failures} failed statement(s).")
+    else:
+        logger.info("Database schema verified (chats, messages, allowed_users, sessions, summaries, memory_store).")
 
 
 async def close_db_pool():
