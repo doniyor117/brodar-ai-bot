@@ -788,36 +788,80 @@ def _attribute(message: Message, text: str) -> str:
     return text
 
 
-MAX_IMAGE_BYTES = 4 * 1024 * 1024  # skip anything larger than 4MB
+MAX_IMAGE_BYTES = 4 * 1024 * 1024   # skip still images larger than 4MB
+MAX_ANIM_BYTES = 12 * 1024 * 1024   # skip animations/gifs larger than 12MB
 
 
-async def _extract_image_data_urls(message: Message, bot: Bot) -> list:
-    """
-    Downloads any images attached to a message and returns them as base64 data URLs.
-    Handles photos and image documents. Only called when the active model has vision.
-    """
-    file_ids = []
+def _message_has_visual(message: Message) -> bool:
+    """True if a message carries something a vision model could look at."""
     if message.photo:
-        # message.photo is ascending sizes; take the largest.
-        file_ids.append((message.photo[-1].file_id, "image/jpeg"))
+        return True
+    if message.animation:
+        return True
+    doc = message.document
+    if doc and (doc.mime_type or "").startswith(("image/", "video/")):
+        return True
+    return False
+
+
+async def _download_file(bot: Bot, file_id: str, max_bytes: int) -> bytes:
+    """Downloads a Telegram file to bytes, or returns b'' if too big / on error."""
+    try:
+        f = await bot.get_file(file_id)
+        if f.file_size and f.file_size > max_bytes:
+            logger.info(f"Skipping file {file_id}: {f.file_size} bytes over limit.")
+            return b""
+        buf = io.BytesIO()
+        await bot.download_file(f.file_path, destination=buf)
+        return buf.getvalue()
+    except Exception as e:
+        logger.warning(f"Failed to download file {file_id}: {e}")
+        return b""
+
+
+def _to_data_url(raw: bytes, mime: str = "image/jpeg") -> str:
+    return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+
+
+async def _extract_visual_data_urls(message: Message, bot: Bot) -> tuple:
+    """
+    Collects images from a message as base64 data URLs.
+    Handles photos, image documents, and animations/GIFs (via ffmpeg frame
+    extraction, thumbnail fallback). Returns (urls, is_gif) where is_gif marks
+    that the images are frames of an animation, so the caller can tell the model.
+    """
+    urls = []
+    is_gif = False
+
+    # 1. Still images (photo or image document)
+    if message.photo:
+        raw = await _download_file(bot, message.photo[-1].file_id, MAX_IMAGE_BYTES)
+        if raw:
+            urls.append(_to_data_url(raw))
     doc = message.document
     if doc and (doc.mime_type or "").startswith("image/"):
-        file_ids.append((doc.file_id, doc.mime_type))
+        raw = await _download_file(bot, doc.file_id, MAX_IMAGE_BYTES)
+        if raw:
+            urls.append(_to_data_url(raw, doc.mime_type))
 
-    urls = []
-    for file_id, mime in file_ids:
-        try:
-            f = await bot.get_file(file_id)
-            if f.file_size and f.file_size > MAX_IMAGE_BYTES:
-                logger.info(f"Skipping image {file_id}: {f.file_size} bytes over limit.")
-                continue
-            buf = io.BytesIO()
-            await bot.download_file(f.file_path, destination=buf)
-            b64 = base64.b64encode(buf.getvalue()).decode()
-            urls.append(f"data:{mime or 'image/jpeg'};base64,{b64}")
-        except Exception as e:
-            logger.warning(f"Failed to download image {file_id}: {e}")
-    return urls
+    # 2. Animation / GIF (silent mp4) or a video document -> extract frames
+    anim = message.animation or (doc if (doc and (doc.mime_type or "").startswith("video/")) else None)
+    if anim:
+        is_gif = True
+        raw = await _download_file(bot, anim.file_id, MAX_ANIM_BYTES)
+        frames = []
+        if raw:
+            import media
+            frames = await asyncio.to_thread(media.extract_video_frames, raw, 2)
+        if frames:
+            urls.extend(_to_data_url(fr) for fr in frames)
+        elif getattr(anim, "thumbnail", None):
+            # Fallback: Telegram's static preview frame (no ffmpeg needed).
+            thumb = await _download_file(bot, anim.thumbnail.file_id, MAX_IMAGE_BYTES)
+            if thumb:
+                urls.append(_to_data_url(thumb))
+
+    return urls, is_gif
 
 
 @router.message(ShouldRespondFilter())
@@ -838,10 +882,10 @@ async def handle_chat_message(message: Message, bot: Bot):
     if BOT_USERNAME:
         cleaned_text = raw_text.replace(f"@{BOT_USERNAME}", "").strip()
 
-    has_image = bool(message.photo or (message.document and (message.document.mime_type or "").startswith("image/")))
+    has_visual = _message_has_visual(message)
 
-    # Nothing to do if there's neither text nor an image.
-    if not cleaned_text and not has_image:
+    # Nothing to do if there's neither text nor a visual.
+    if not cleaned_text and not has_visual:
         return
 
     # Whether this sender may drive state-changing tools (persona/skill edits,
@@ -849,16 +893,30 @@ async def handle_chat_message(message: Message, bot: Bot):
     privileged = await is_user_privileged(message, bot)
     show_tool_notes = await cache.get_chat_tool_notes(chat_id)
 
-    # Only download images if the active model can actually see them.
+    # Only download/extract visuals if the active model can actually see them.
     image_urls = []
-    if has_image:
+    is_gif = False
+    if has_visual:
         active_spec = models.resolve_spec(await cache.get_active_model())
         if active_spec.supports_vision:
-            image_urls = await _extract_image_data_urls(message, bot)
+            image_urls, is_gif = await _extract_visual_data_urls(message, bot)
 
-    # What we store/show as the user's text (images aren't persisted in history).
+    # What we store/show as the user's text (visuals aren't persisted in history).
     # In groups it's prefixed with the speaker's name for multi-person context.
-    text_for_model = cleaned_text or ("[sent an image]" if has_image else "")
+    if cleaned_text:
+        text_for_model = cleaned_text
+    elif is_gif:
+        text_for_model = "[sent a gif]"
+    elif has_visual:
+        text_for_model = "[sent an image]"
+    else:
+        text_for_model = ""
+    # When we send GIF frames, tell the model they're stills from one animation.
+    if is_gif and image_urls:
+        text_for_model += (
+            f"\n\n(note: the {len(image_urls)} image(s) attached are still frames "
+            "extracted from a gif/animation the user sent — first and middle frame.)"
+        )
     attributed_text = _attribute(message, text_for_model)
 
     history = await cache.get_chat_history(chat_id)
