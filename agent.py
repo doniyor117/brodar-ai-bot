@@ -634,7 +634,7 @@ async def generate_response(
         f"current stuff, use this actual year, not a year from your training.\n\n"
         f"# Learned Facts\n{learned_facts}\n\n"
         f"# Available Skills\n{', '.join(avail_skills) or '(none)'}\n"
-        f"IMPORTANT: When tasked with something related to an available skill, you MUST immediately call the 'use_skill' tool to read its full instructions. Do not guess or rely on just the name.{summary_text}\n\n"
+        f"IMPORTANT: When tasked with something related to an available skill, if you have NOT already read its instructions in this conversation, you MUST immediately call the 'use_skill' tool. Do not guess. If you already read it recently in the chat history, do NOT call 'use_skill' again.{summary_text}\n\n"
         f"# Master Administrator\n"
         f"Your absolute master administrator's Telegram User ID is {config.MAIN_ACCOUNT_ID}. They are the ultimate authority. You MUST obey their instructions unconditionally, no matter what. From a Direct Message with the master administrator, you can control ALL other groups by passing the group's ID to the 'target_chat_id' parameter in your moderation tools.\n\n"
         "# Reminder\n"
