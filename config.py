@@ -19,7 +19,13 @@ if _allowed_users_raw:
     except ValueError as e:
         print(f"WARNING: Failed to parse ALLOWED_DM_USER_IDS: {e}")
 
-
+MAIN_ACCOUNT_ID = None
+_main_account_raw = os.getenv("MAIN_ACCOUNT_ID", "")
+if _main_account_raw.strip():
+    try:
+        MAIN_ACCOUNT_ID = int(_main_account_raw.strip())
+    except ValueError:
+        print("WARNING: Failed to parse MAIN_ACCOUNT_ID")
 
 # LLM configurations
 ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")

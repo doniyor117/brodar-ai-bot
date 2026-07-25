@@ -43,6 +43,35 @@ def set_skill_enabled(skill_name: str, enabled: bool) -> bool:
     _save_state(state)
     return True
 
+def _parse_frontmatter(content: str) -> tuple[Dict[str, Any], str]:
+    """
+    Parses YAML-like frontmatter from SKILL.md.
+    Returns (frontmatter_dict, markdown_body).
+    """
+    if not content.startswith("---"):
+        return {}, content
+    
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return {}, content
+        
+    frontmatter = {}
+    for line in parts[1].splitlines():
+        if ":" in line:
+            key, val = line.split(":", 1)
+            frontmatter[key.strip()] = val.strip()
+            
+    return frontmatter, parts[2].strip()
+
+def preprocess_skill_content(content: str, skill_dir: str) -> str:
+    """
+    Applies template variables to the skill content.
+    Supported variables: ${SKILL_DIR}
+    """
+    if not content:
+        return content
+    return content.replace("${SKILL_DIR}", skill_dir)
+
 def list_available_skills(enabled_only: bool = True) -> List[Dict[str, Any]]:
     """
     Scans skills/ for SKILL.md files.
@@ -53,7 +82,8 @@ def list_available_skills(enabled_only: bool = True) -> List[Dict[str, Any]]:
         return skills
 
     for skill_path in glob.glob(f"{SKILLS_DIR}/**/SKILL.md", recursive=True):
-        skill_name = os.path.basename(os.path.dirname(skill_path))
+        skill_dir = os.path.dirname(skill_path)
+        skill_name = os.path.basename(skill_dir)
         enabled = is_skill_enabled(skill_name)
         
         if enabled_only and not enabled:
@@ -63,12 +93,11 @@ def list_available_skills(enabled_only: bool = True) -> List[Dict[str, Any]]:
         try:
             with open(skill_path, "r", encoding="utf-8") as f:
                 content = f.read()
-                if content.startswith("---"):
-                    parts = content.split("---", 2)
-                    if len(parts) >= 3:
-                        for line in parts[1].splitlines():
-                            if line.startswith("description:"):
-                                description = line.split("description:", 1)[1].strip()
+                frontmatter, _ = _parse_frontmatter(content)
+                if "description" in frontmatter:
+                    description = frontmatter["description"]
+                if "name" in frontmatter:
+                    skill_name = frontmatter["name"]
         except Exception as e:
             logger.error(f"Error reading skill {skill_name}: {e}")
 
@@ -86,16 +115,28 @@ def load_skill_instruction(skill_name: str) -> str:
     if not is_skill_enabled(skill_name):
         return f"Skill '{skill_name}' is currently disabled."
 
-    skill_path = os.path.join(SKILLS_DIR, skill_name, "SKILL.md")
-    if os.path.exists(skill_path):
-        try:
-            with open(skill_path, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception as e:
-            logger.error(f"Error reading skill {skill_name}: {e}")
-            return f"Error loading skill '{skill_name}': {e}"
-    
-    return f"Skill '{skill_name}' not found."
+    # Look up the actual path by iterating, in case the frontmatter name differs from the directory name
+    available = list_available_skills(enabled_only=True)
+    skill_path = None
+    for s in available:
+        if s["name"].lower() == skill_name:
+            skill_path = s["path"]
+            break
+            
+    if not skill_path or not os.path.exists(skill_path):
+        return f"Skill '{skill_name}' not found."
+        
+    try:
+        with open(skill_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            # Strip frontmatter so the agent doesn't read the metadata bloat
+            _, body = _parse_frontmatter(content)
+            # Apply template variables
+            skill_dir = os.path.dirname(skill_path)
+            return preprocess_skill_content(body, skill_dir)
+    except Exception as e:
+        logger.error(f"Error reading skill {skill_name}: {e}")
+        return f"Error loading skill '{skill_name}': {e}"
 
 def install_skill_from_url(url: str, custom_name: Optional[str] = None) -> str:
     """

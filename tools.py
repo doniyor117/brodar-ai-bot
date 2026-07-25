@@ -105,8 +105,14 @@ ALLOWED_COMMANDS = {
     },
     "find": {
         "bin": "find",
-        "args_regex": r"^\.\s+-name\s+['\"][a-zA-Z0-9_*.-]+['\"]$",
-        "description": "Finds files by name.",
+        "args_regex": r"^$|^.+(-name|-type).+$",
+        "description": "Finds files.",
+        "has_path_args": True,
+    },
+    "cd": {
+        "bin": "cd",
+        "args_regex": r"^[a-zA-Z0-9_./-]+$|^\.\.$",
+        "description": "Changes the current directory.",
         "has_path_args": True,
     }
 }
@@ -154,16 +160,39 @@ def _path_args_are_safe(args_list: List[str], workspace: str) -> bool:
 
 def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
     """
-    Executes a web search on DuckDuckGo.
+    Executes a web search. Uses Exa if EXA_API_KEY is present, else falls back to DuckDuckGo.
     Returns a list of dicts with title, url, and snippet.
     """
-    if DDGS is None:
-        return [{"error": "DuckDuckGo search package is not installed/available."}]
-
     if not query.strip():
         return [{"error": "Empty search query."}]
 
     logger.info(f"Executing web search for: '{query}'")
+    
+    exa_key = os.getenv("EXA_API_KEY")
+    if exa_key:
+        try:
+            from exa_py import Exa
+            exa = Exa(exa_key)
+            res = exa.search_and_contents(query, num_results=max_results)
+            if not res.results:
+                return [{"message": "No results found."}]
+            return [
+                {
+                    "title": r.title,
+                    "url": r.url,
+                    "snippet": r.text[:500] if r.text else ""
+                }
+                for r in res.results
+            ]
+        except ImportError:
+            logger.warning("EXA_API_KEY is set but exa_py package is missing. Falling back to DuckDuckGo.")
+        except Exception as e:
+            logger.error(f"Exa search error: {e}")
+            return [{"error": f"Exa search failed: {str(e)}"}]
+
+    if DDGS is None:
+        return [{"error": "DuckDuckGo search package is not installed/available."}]
+
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
@@ -181,7 +210,9 @@ def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
         logger.error(f"DuckDuckGo search error: {e}", exc_info=True)
         return [{"error": f"Search failed: {str(e)}"}]
 
-def execute_shell_command(command: str, args_str: str = "") -> str:
+_terminal_sessions = {}
+
+def execute_shell_command(command: str, args_str: str = "", chat_id: str = "default") -> str:
     """
     Executes a whitelisted shell command safely using subprocess without shell=True.
     Validates arguments against a strict regex whitelist, confines file-touching
@@ -217,10 +248,30 @@ def execute_shell_command(command: str, args_str: str = "") -> str:
     # 5. Confine filesystem commands to the sandbox workspace.
     # This is the core defense: .env and the source tree live OUTSIDE this dir,
     # so no combination of cat/grep/head/tail/find/ls can read secrets.
-    workspace = _workspace_dir()
+    base_workspace = _workspace_dir()
+    
+    current_cwd = _terminal_sessions.get(chat_id, base_workspace)
+    if not os.path.exists(current_cwd):
+        current_cwd = base_workspace
+        _terminal_sessions[chat_id] = current_cwd
+        
     if cmd_config.get("has_path_args"):
-        if not _path_args_are_safe(args_list, workspace):
+        # validate paths against base_workspace so they can't escape
+        if not _path_args_are_safe(args_list, base_workspace):
             return "Error: Path arguments must stay inside the sandbox workspace. Access denied."
+
+    # Handle cd built-in
+    if command == "cd":
+        if not args_list:
+            return "Error: cd requires a path argument."
+        target = args_list[0]
+        new_cwd = os.path.realpath(os.path.join(current_cwd, target))
+        if new_cwd != base_workspace and not new_cwd.startswith(base_workspace + os.sep):
+            return "Error: Cannot cd outside of sandbox workspace."
+        if not os.path.isdir(new_cwd):
+            return f"Error: '{target}' is not a directory."
+        _terminal_sessions[chat_id] = new_cwd
+        return f"Changed directory to {new_cwd.replace(base_workspace, '~')}"
 
     # 6. Sanitize environment (remove secrets)
     env = os.environ.copy()
@@ -235,7 +286,7 @@ def execute_shell_command(command: str, args_str: str = "") -> str:
 
     # 7. Execute the command with a strict timeout, rooted in the sandbox.
     full_cmd = [bin_path] + args_list
-    logger.info(f"Executing safe command in {workspace}: {full_cmd}")
+    logger.info(f"Executing safe command in {current_cwd}: {full_cmd}")
 
     try:
         result = subprocess.run(
@@ -246,7 +297,7 @@ def execute_shell_command(command: str, args_str: str = "") -> str:
             shell=False,
             timeout=5.0,  # Strict 5s timeout
             env=env,
-            cwd=workspace,
+            cwd=current_cwd,
         )
         output = result.stdout
         if result.stderr:

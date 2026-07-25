@@ -291,6 +291,64 @@ TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["action"]
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_env_file",
+            "description": "Modifies the bot's .env file (environment variables). Admin-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Environment variable key to set."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Environment variable value to set."
+                    }
+                },
+                "required": ["key", "value"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "install_skill_from_url",
+            "description": "Downloads and installs a new skill from a raw URL. Admin-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Raw URL to the SKILL.md content."
+                    },
+                    "custom_name": {
+                        "type": "string",
+                        "description": "Optional custom name for the skill directory."
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "uninstall_skill",
+            "description": "Uninstalls a skill completely from the bot. Admin-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Name of the skill to remove."
+                    }
+                },
+                "required": ["skill_name"]
             }
         }
     }
@@ -363,6 +421,9 @@ _PRIVILEGED_TOOLS = {
     "edit_persona_file",
     "manage_skill_file",
     "group_moderation_tool",
+    "edit_env_file",
+    "install_skill_from_url",
+    "uninstall_skill",
 }
 
 
@@ -620,19 +681,31 @@ async def generate_response(
                 await _notify(bot_instance, chat_id, _tool_status_line(tool_name, args))
 
             # Central authorization gate for state-mutating tools.
-            if tool_name in _PRIVILEGED_TOOLS and not requester_is_privileged:
-                logger.warning(f"Blocked privileged tool '{tool_name}' for non-privileged requester in chat {chat_id}.")
-                tool_result = (
-                    f"Permission Denied: '{tool_name}' can only be used by an authorized admin. "
-                    "Tell the user you can't do that for them."
-                )
-                full_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "name": tool_name,
-                    "content": tool_result,
-                })
-                continue
+            if tool_name in _PRIVILEGED_TOOLS:
+                if not requester_is_privileged:
+                    logger.warning(f"Blocked privileged tool '{tool_name}' for non-privileged requester in chat {chat_id}.")
+                    tool_result = (
+                        f"Permission Denied: '{tool_name}' can only be used by an authorized admin. "
+                        "Tell the user you can't do that for them."
+                    )
+                    full_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "name": tool_name,
+                        "content": tool_result,
+                    })
+                    continue
+                else:
+                    is_approved = await _request_interactive_approval(bot_instance, chat_id, tool_name, args)
+                    if not is_approved:
+                        tool_result = f"Action '{tool_name}' was denied by the user."
+                        full_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "name": tool_name,
+                            "content": tool_result,
+                        })
+                        continue
 
             if tool_name == "search_web":
                 query = args.get("query", "")
@@ -643,7 +716,7 @@ async def generate_response(
                 args_str = args.get("args_str", "")
                 # Blocking subprocess — run off the event loop. The workspace
                 # sandbox in tools.py already prevents reading .env.
-                tool_result = await asyncio.to_thread(execute_shell_command_wrapper, command, args_str)
+                tool_result = await asyncio.to_thread(execute_shell_command_wrapper, command, args_str, str(chat_id))
             elif tool_name == "use_skill":
                 skill_name = args.get("skill_name", "")
                 tool_result = skills.load_skill_instruction(skill_name)
@@ -663,6 +736,17 @@ async def generate_response(
                 per_c = args.get("content", "")
                 success = memory.write_persona_md(per_c)
                 tool_result = "PERSONA.md updated." if success else "Failed to update PERSONA.md."
+            elif tool_name == "edit_env_file":
+                env_key = args.get("key", "")
+                env_val = args.get("value", "")
+                tool_result = _edit_env_file(env_key, env_val)
+            elif tool_name == "install_skill_from_url":
+                url = args.get("url", "")
+                c_name = args.get("custom_name")
+                tool_result = skills.install_skill_from_url(url, custom_name=c_name)
+            elif tool_name == "uninstall_skill":
+                sk_name = args.get("skill_name", "")
+                tool_result = skills.uninstall_skill(sk_name)
             elif tool_name == "group_moderation_tool":
                 if not bot_instance or not chat_id:
                     tool_result = "Error: Group moderation tool unavailable in this context."
@@ -769,7 +853,69 @@ def search_web_wrapper(query: str) -> str:
             formatted.append(f"Title: {r['title']}\nURL: {r['url']}\nSnippet: {r['snippet']}\n")
     return "\n---\n".join(formatted)
 
-def execute_shell_command_wrapper(command: str, args_str: str) -> str:
+def execute_shell_command_wrapper(command: str, args_str: str, chat_id: str = "default") -> str:
     """Helper to execute whitelisted command and format output."""
-    output = tools.execute_shell_command(command, args_str)
+    output = tools.execute_shell_command(command, args_str, chat_id=chat_id)
     return f"Execution Output:\n{output}"
+
+def _edit_env_file(key: str, value: str) -> str:
+    import os
+    env_file = os.path.join(os.path.dirname(__file__), ".env")
+    lines = []
+    updated = False
+    if os.path.exists(env_file):
+        with open(env_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            
+    with open(env_file, "w", encoding="utf-8") as f:
+        for line in lines:
+            if line.strip().startswith(f"{key}="):
+                f.write(f"{key}={value}\n")
+                updated = True
+            else:
+                f.write(line)
+        if not updated:
+            f.write(f"{key}={value}\n")
+            
+    return f"Set {key} in .env file. Note: The bot may need to be restarted to pick up environment changes."
+
+async def _request_interactive_approval(bot_instance, chat_id: int, tool_name: str, args: dict) -> bool:
+    if not bot_instance:
+        return False
+        
+    import uuid
+    import asyncio
+    import json
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    import bot
+    
+    call_id = str(uuid.uuid4())[:8]
+    future = asyncio.get_running_loop().create_future()
+    bot.pending_approvals[call_id] = future
+    
+    args_str = json.dumps(args, indent=2)[:300]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve:{call_id}"),
+         InlineKeyboardButton(text="❌ Deny", callback_data=f"deny:{call_id}")]
+    ])
+    
+    try:
+        target_chat_id = config.MAIN_ACCOUNT_ID if config.MAIN_ACCOUNT_ID else chat_id
+        await bot_instance.send_message(
+            chat_id=target_chat_id, 
+            text=f"⚠️ **Approval Required**\nThe agent wants to execute a privileged tool in chat `{chat_id}`:\n\n**Tool**: `{tool_name}`\n**Args**: `{args_str}`", 
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        if target_chat_id != chat_id:
+            await _notify(bot_instance, chat_id, f"sent an approval request to the main admin account for `{tool_name}`. waiting for them to tap approve...")
+            
+        # Wait up to 5 minutes for approval
+        return await asyncio.wait_for(future, timeout=300)
+    except asyncio.TimeoutError:
+        bot.pending_approvals.pop(call_id, None)
+        logger.warning(f"Approval for {tool_name} timed out.")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to request interactive approval: {e}")
+        return False

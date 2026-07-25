@@ -24,6 +24,24 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+pending_approvals = {}
+
+@router.callback_query(F.data.startswith("approve:") | F.data.startswith("deny:"))
+async def handle_approval(callback: CallbackQuery):
+    action, call_id = callback.data.split(":", 1)
+    if call_id in pending_approvals:
+        future = pending_approvals.pop(call_id)
+        if not future.done():
+            future.set_result(action == "approve")
+        
+        # Determine status visually
+        status_text = "✅ Approved" if action == "approve" else "❌ Denied"
+        
+        # We replace the inline keyboard with the status message, keeping the original text
+        msg_text = callback.message.text
+        await callback.message.edit_text(f"{msg_text}\n\n{status_text} by @{callback.from_user.username}")
+    await callback.answer(f"Tool {action}d")
+
 class ModelCallback(CallbackData, prefix="model"):
     """Inline-button payload for the /model picker."""
     key: str
@@ -73,7 +91,7 @@ class AccessControlMiddleware(BaseMiddleware):
         cmd = text.strip().split()[0].lower() if text.strip() else ""
 
         # Admin & system control commands allowed in inactive groups
-        allowed_group_cmds = ["/activate", "/deactivate", "/allow_user", "/disallow_user", "/start", "/help", "/status"]
+        allowed_group_cmds = ["/activate", "/deactivate", "/allow_user", "/disallow_user", "/start", "/help", "/status", "/set_main_account"]
         if any(cmd.startswith(c) for c in allowed_group_cmds):
             if not user_id or not await cache.is_user_allowed(user_id):
                 logger.info(f"Ignoring admin command '{text}' from unauthorized user {user_id} in group {chat_id}")
@@ -113,8 +131,64 @@ async def init_bot_info(bot: Bot):
         me = await bot.get_me()
         BOT_USERNAME = me.username
         logger.info(f"Bot info loaded. Username: @{BOT_USERNAME}")
+        await set_bot_commands(bot)
     except Exception as e:
         logger.error(f"Failed to fetch bot info: {e}")
+
+async def set_bot_commands(bot: Bot):
+    from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeAllChatAdministrators
+
+    # Private chats (DMs) commands
+    private_commands = [
+        BotCommand(command="help", description="Show what the bot can do"),
+        BotCommand(command="status", description="View bot status and uptime"),
+        BotCommand(command="clear", description="Reset chat context and history"),
+        BotCommand(command="skills", description="List available skill instructions"),
+        BotCommand(command="memory", description="View stored persistent facts"),
+        BotCommand(command="stop", description="Halt active agent tasks for this chat"),
+        BotCommand(command="new", description="Start a fresh session"),
+        BotCommand(command="sessions", description="List active sessions"),
+        BotCommand(command="switch_session", description="Switch between sessions"),
+        BotCommand(command="compress", description="Compact current session history"),
+        BotCommand(command="set_main_account", description="(Admin) Set this account as the main master account"),
+        BotCommand(command="allow_user", description="(Admin) Grant DM access to a user"),
+        BotCommand(command="disallow_user", description="(Admin) Revoke DM access"),
+        BotCommand(command="toggle_tools", description="(Admin) Show or hide tool-activity clues"),
+        BotCommand(command="model", description="(Admin) Switch the active AI model"),
+        BotCommand(command="install_skill", description="(Admin) Install a new skill from URL"),
+        BotCommand(command="enable_skill", description="(Admin) Enable an installed skill"),
+        BotCommand(command="disable_skill", description="(Admin) Disable a skill"),
+        BotCommand(command="uninstall_skill", description="(Admin) Delete a skill"),
+        BotCommand(command="stop_all", description="(Admin) Global emergency kill switch"),
+    ]
+
+    # Group chats (regular users)
+    group_commands = [
+        BotCommand(command="help", description="Show what the bot can do"),
+        BotCommand(command="status", description="View bot status and uptime"),
+        BotCommand(command="clear", description="Reset chat context and history"),
+        BotCommand(command="stop", description="Halt active agent tasks for this chat"),
+        BotCommand(command="new", description="Start a fresh session"),
+    ]
+
+    # Group chats (Administrators)
+    group_admin_commands = group_commands + [
+        BotCommand(command="activate", description="(Admin) Enable bot in group"),
+        BotCommand(command="deactivate", description="(Admin) Disable bot in group"),
+        BotCommand(command="toggle_reply", description="(Group Admin) Toggle mention-only vs reply-all mode"),
+        BotCommand(command="promote", description="(Group Admin) Promote user to admin"),
+        BotCommand(command="demote", description="(Group Admin) Demote user"),
+        BotCommand(command="ban", description="(Group Admin) Ban user"),
+        BotCommand(command="unban", description="(Group Admin) Unban user"),
+        BotCommand(command="mute", description="(Group Admin) Mute user"),
+        BotCommand(command="unmute", description="(Group Admin) Unmute user"),
+        BotCommand(command="set_title", description="(Group Admin) Set group title"),
+    ]
+
+    await bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
+    await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+    await bot.set_my_commands(group_admin_commands, scope=BotCommandScopeAllChatAdministrators())
+    logger.info("Bot commands configured successfully with separate visibilities.")
 
 class ShouldRespondFilter(BaseFilter):
     """
@@ -340,6 +414,7 @@ async def cmd_help(message: Message):
         "- /deactivate (authorized users): disable bot in group.\n"
         "- /allow_user <id> (authorized users): grant DM access to a user.\n"
         "- /disallow_user <id> (authorized users): revoke DM access.\n"
+        "- /set_main_account (authorized users): set this current account as the main master account.\n"
         "- /toggle_reply (group admins): toggle mention-only vs reply-all mode.\n"
         "- /toggle_tools (admins): show or hide the tool-activity clues.\n"
         "- /model (admins): switch the ai model (some can see images)."
@@ -469,6 +544,18 @@ async def cmd_disallow_user(message: Message):
     target_id = int(parts[1])
     cache.remove_allowed_user(target_id)
     await message.reply(f"user {target_id} removed from the allowed users list.")
+
+@router.message(Command("set_main_account"))
+async def cmd_set_main_account(message: Message, bot: Bot):
+    """Dynamically sets the sender's account as the main master account."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can run this.")
+        return
+
+    user_id = message.from_user.id
+    config.MAIN_ACCOUNT_ID = user_id
+    agent._edit_env_file("MAIN_ACCOUNT_ID", str(user_id))
+    await message.reply(f"this account ({user_id}) is now set as the main master account. interactive approvals will be routed here.")
 
 @router.message(Command("status"))
 async def cmd_status(message: Message):

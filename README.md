@@ -173,6 +173,13 @@ The Z.ai free tier rate limits request concurrency to 1. To prevent `429` (Too M
 
 ## 7. Changelog
 
+### Exa Web Search, Advanced Terminal & Interactive Approvals (2026-07-25)
+* **Exa Web Search Native Support (`tools.py`)**: Web search natively supports `exa_py` for neural-search AI web results if `EXA_API_KEY` is present in `.env`. Falls back to DuckDuckGo search automatically. No bloated plugins required.
+* **Advanced Terminal Sandbox (`tools.py`)**: The `execute_shell_command` tool now maintains a persistent `cwd` (Current Working Directory) per-chat using a `_terminal_sessions` dict, enabling native `cd` operations and persistent terminal traversal without leaving the sandbox.
+* **Telegram Interactive Approvals (`agent.py`, `bot.py`)**: Execution of strictly privileged tools (such as `.env` modification or downloading skills) now triggers an asynchronous **Inline Keyboard Prompt** (Approve / Deny) directly in the Telegram chat. 
+  - Admins can use `/set_main_account` to designate a master account; approvals will route seamlessly to that account's DMs.
+* **Auto-Registered Scoped Commands (`bot.py`)**: The bot automatically registers its command menus to Telegram via `set_my_commands` on startup with scoped visibilities. Private chats see full admin capabilities, while group chats only see basic safe commands (unless you are a group admin). No BotFather manual config needed.
+
 ### Multimodal Context, Forwarded Messages & Natural Human Dynamics (2026-07-25)
 * **Full Audio/Video Multimodal Context (`media.py`, `bot.py`)**: Uses `ffmpeg` to extract full audio tracks (normalized to tiny 32kbps mono mp3s) from Voice messages, Audio files, Video Notes, and Videos. Dynamically extracts evenly-spaced video frames and bundles BOTH audio and visual timelines into the LLM context (data URLs) for complete multimodal awareness. Safely skips files > 20MB.
 * **Rapid-Fire & Forwarded Debounce System**: Implemented a sliding-window debounce for chat handlers using a global timestamp tracker. Normal messages wait 1.5s, Forwarded messages wait 8.0s. If the user rapidly sends multiple messages or a follow-up to a forward, only the newest handler wakes up, effortlessly batching all immediately-saved history into a single cohesive response without duplicating LLM replies.

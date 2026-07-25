@@ -379,3 +379,15 @@ we also should increase the bot to bot turn limits to 10. i confirm the plan
 ```
 hermes agent has fully implemented it. learn from it. or can we directly import that code parts to our bot?
 ```
+
+## Prompt 49
+
+```
+also hermes have great web search capabilities and it also soppurts exa or we can roll back to just duck duck go. can we implement that thing too? what about shell and terminal? and permission request message and notes like stuff in hermes? lets implemet all of them. do some research
+```
+
+## Prompt 50
+
+```
+lets do them all! then update help, readme and session prompts file and then give me new full set of commands ti register them in botfahter inthe way how it accepts
+```
