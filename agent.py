@@ -377,6 +377,23 @@ TOOLS_SCHEMA = [
                 "required": ["skill_name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "image_generate",
+            "description": "Generates an image from a text prompt and sends it to the user.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "A detailed description of the image to generate."
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
     }
 ]
 
@@ -832,6 +849,25 @@ async def generate_response(
                     lines = [f"{name} (ID: {uid})" for uid, name in results.items()]
                     search_scope = f"chat {action_chat_id}" if action_chat_id else "all known chats"
                     tool_result = f"Found users in {search_scope}:\n" + "\n".join(lines)
+            elif tool_name == "image_generate":
+                prompt_text = args.get("prompt", "")
+                try:
+                    import litellm
+                    logger.info(f"Generating image for prompt: '{prompt_text}' using model: {config.IMAGE_MODEL_NAME}")
+                    # litellm.image_generation is sync, so we run it in a thread
+                    response = await asyncio.to_thread(
+                        litellm.image_generation,
+                        prompt=prompt_text,
+                        model=config.IMAGE_MODEL_NAME
+                    )
+                    url = response.data[0].url
+                    if bot_instance and chat_id:
+                        await bot_instance.send_photo(chat_id, photo=url, caption=f"Generated: {prompt_text}")
+                    tool_result = f"Successfully generated image and sent it to the chat. URL: {url}"
+                except Exception as e:
+                    err_msg = str(e)
+                    logger.error(f"Image generation failed: {err_msg}")
+                    tool_result = f"Failed to generate image: {err_msg}"
             else:
                 tool_result = f"Error: Unknown tool '{tool_name}'."
 

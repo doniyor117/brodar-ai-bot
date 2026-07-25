@@ -34,6 +34,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # Default active model — must be a key in models.MODELS. Can be changed at
 # runtime with /model; the choice is persisted globally.
 MODEL_NAME = os.getenv("MODEL_NAME", "glm-4.7-flash")
+# Default model for image generation
+IMAGE_MODEL_NAME = os.getenv("IMAGE_MODEL_NAME", "dall-e-3")
 
 # Number of LLM API calls allowed in flight at once. The Z.ai free tier is
 # concurrency limited, but 1 means a single slow chat blocks every other chat.
