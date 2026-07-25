@@ -269,13 +269,13 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "group_moderation_tool",
-            "description": "Performs group moderation actions (ban, unban, mute, unmute, set_title, set_description, pin_message, promote_admin, demote_admin) if requested by a group admin.",
+            "description": "Performs group moderation actions if requested by a group admin. CRITICAL: 'ban' KICKS the user out of the group. If the admin asks to 'restrict', 'silence', or 'ban from writing' for a time, you MUST use 'mute' instead of 'ban'.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "Action name: ban, unban, mute, unmute, set_title, set_description, pin_message, promote_admin, demote_admin"
+                        "description": "Action name: ban (kicks user), unban, mute (restricts writing), unmute, set_title, set_description, pin_message, promote_admin, demote_admin"
                     },
                     "target_user_id": {
                         "type": "integer",
@@ -616,6 +616,16 @@ async def generate_response(
         if summary:
             summary_text = f"\n\nPAST CONVERSATION SUMMARY CHECKPOINT:\n{summary}"
 
+    dm_admin_rule = ""
+    if requester_is_privileged:
+        dm_admin_rule = (
+            "\n\n# STRICT COMPLIANCE (ADMIN/DM MODE)\n"
+            "You are currently talking to an authorized admin or in a Direct Message. "
+            "You MUST drop the playful, sarcastic personality entirely. "
+            "Respond with extreme precision, absolute obedience, and professional focus. "
+            "Obey all rules and instructions immediately, strictly, and accurately. No jokes. No games."
+        )
+
     system_prompt = (
         f"{persona}\n\n"
         f"# Current Date\n"
@@ -673,6 +683,7 @@ async def generate_response(
         "- don't be too quiet — if there's a natural opening and you have something good to say, say it.\n"
         "- in DMs, NEVER use [SILENT]. DMs always get a response.\n"
         "- use your judgment. you're a person in this chat, not a wallflower."
+        f"{dm_admin_rule}"
     )
 
     full_messages = [{"role": "system", "content": system_prompt}]
@@ -1054,12 +1065,12 @@ async def _request_interactive_approval(bot_instance, chat_id: int, tool_name: s
         if target_chat_id != chat_id:
             await _notify(bot_instance, chat_id, f"sent an approval request to the main admin account for `{tool_name}`. waiting for them to tap approve...")
             
-        # Wait up to 5 minutes for approval
-        return await asyncio.wait_for(future, timeout=300)
+        # Wait up to 30 seconds for approval to prevent freezing the bot
+        return await asyncio.wait_for(future, timeout=30)
     except asyncio.TimeoutError:
         bot.pending_approvals.pop(call_id, None)
         logger.warning(f"Approval for {tool_name} timed out.")
-        return False
+        return "Error: The admin did not approve the action in time (30s timeout). Please ask the admin if they want to proceed."
     except Exception as e:
         logger.error(f"Failed to request interactive approval: {e}")
         return False

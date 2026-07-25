@@ -20,5 +20,6 @@ The `send_file` tool uploads a file from the server's local file system directly
 - **caption** (string, optional): A text message to attach underneath the file.
 
 ### Important Notes
+- **Verify before sending:** ALWAYS use `execute_shell_command` with `ls /path/to/file` or check if the file exists before calling `send_file`. If it doesn't exist, don't guess the path.
 - **You can only send local files.** If the user asks for a file from the internet, you must first download it locally using `execute_shell_command` (e.g., `wget -O /tmp/file.jpg <url>`), and then use `send_file` with the path `/tmp/file.jpg`.
 - **Generated Images:** If the user asks you to *generate* an image, do NOT use this tool. Use the `image_generate` tool instead. Use `send_file` only for existing files.

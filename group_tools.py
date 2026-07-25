@@ -20,7 +20,12 @@ async def unban_member(bot: Bot, chat_id: int, user_id: int) -> str:
     """Unbans a user from the group."""
     try:
         await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
-        return f"User {user_id} has been unbanned."
+        try:
+            # Generate a one-time invite link for the user to rejoin
+            invite = await bot.create_chat_invite_link(chat_id=chat_id, member_limit=1)
+            return f"User {user_id} has been unbanned. Since bots cannot forcefully add users, here is their one-time invite link to rejoin: {invite.invite_link}"
+        except Exception as link_e:
+            return f"User {user_id} has been unbanned. Failed to generate invite link: {link_e}"
     except Exception as e:
         logger.error(f"Error unbanning user {user_id} in chat {chat_id}: {e}")
         return f"Failed to unban user {user_id}: {e}"
