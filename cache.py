@@ -32,13 +32,27 @@ def track_user(chat_id: int, user_id: int, name: str):
         _user_names_cache[chat_id] = {}
     _user_names_cache[chat_id][user_id] = name
     
-def search_users(chat_id: int, query: str = "") -> dict:
-    if chat_id not in _user_names_cache:
-        return {}
-    if not query:
-        return _user_names_cache[chat_id]
-    q = query.lower()
-    return {uid: name for uid, name in _user_names_cache[chat_id].items() if q in name.lower() or q in str(uid)}
+def search_users(chat_id: Optional[int] = None, query: str = "") -> dict:
+    results = {}
+    q = query.lower() if query else ""
+    
+    # If chat_id is provided, only search that chat
+    if chat_id is not None:
+        if chat_id not in _user_names_cache:
+            return {}
+        chats_to_search = {chat_id: _user_names_cache[chat_id]}
+    else:
+        # Otherwise search all known chats
+        chats_to_search = _user_names_cache
+
+    for cid, users in chats_to_search.items():
+        for uid, name in users.items():
+            if not q or q in name.lower() or q in str(uid):
+                # We prefix the name with the chat_id in global searches to differentiate
+                display_name = f"{name} (in chat {cid})" if chat_id is None else name
+                results[uid] = display_name
+                
+    return results
 _write_tasks: set = set()
 
 def _spawn_db_write(coro) -> None:

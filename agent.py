@@ -279,11 +279,11 @@ TOOLS_SCHEMA = [
                     },
                     "target_user_id": {
                         "type": "integer",
-                        "description": "User ID for moderation action"
+                        "description": "User ID for moderation action. Use search_group_members first if you don't know it."
                     },
                     "target_chat_id": {
                         "type": "integer",
-                        "description": "Optional. The specific group chat ID to perform the action in. Use this when commanding a group from a direct message."
+                        "description": "Optional. The specific group chat ID to perform the action in. Use search_group_members first if you don't know it."
                     },
                     "text_param": {
                         "type": "string",
@@ -302,13 +302,13 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "search_group_members",
-            "description": "Searches for members (by name or username) who have recently spoken in a group chat to get their User IDs for moderation.",
+            "description": "Searches for members (by name or username) who have recently spoken in a group chat to get their User IDs and Chat IDs for moderation.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_chat_id": {
                         "type": "integer",
-                        "description": "Optional. The specific group chat ID to search in."
+                        "description": "Optional. The specific group chat ID to search in. Omit to search across ALL known groups."
                     },
                     "query": {
                         "type": "string",
@@ -780,11 +780,15 @@ async def generate_response(
                     tool_result = "Error: Group moderation tool unavailable in this context."
                 else:
                     import group_tools
+                    def _safe_int(v, default):
+                        try: return int(v)
+                        except: return default
+
                     act = args.get("action", "")
-                    target_uid = args.get("target_user_id", 0)
+                    target_uid = _safe_int(args.get("target_user_id"), 0)
                     text_p = args.get("text_param", "")
-                    duration = args.get("duration_seconds", 0)
-                    action_chat_id = args.get("target_chat_id", chat_id)
+                    duration = _safe_int(args.get("duration_seconds"), 0)
+                    action_chat_id = _safe_int(args.get("target_chat_id"), chat_id)
 
                     if act == "ban":
                         tool_result = await group_tools.ban_member(bot_instance, action_chat_id, target_uid, duration)
@@ -808,14 +812,26 @@ async def generate_response(
                     else:
                         tool_result = f"Unknown moderation action '{act}'."
             elif tool_name == "search_group_members":
-                action_chat_id = args.get("target_chat_id", chat_id)
+                def _safe_int(v, default):
+                    if v is None: return default
+                    try: return int(v)
+                    except: return default
+                
+                # If target_chat_id is completely omitted, default to None (global search)
+                # If it's provided but invalid, fallback to chat_id
+                action_chat_id = args.get("target_chat_id")
+                if action_chat_id is not None:
+                    action_chat_id = _safe_int(action_chat_id, chat_id)
+                    
                 query = args.get("query", "")
                 results = cache.search_users(action_chat_id, query)
                 if not results:
-                    tool_result = f"No users found in chat {action_chat_id} matching '{query}'."
+                    search_scope = f"chat {action_chat_id}" if action_chat_id else "any known chat"
+                    tool_result = f"No users found in {search_scope} matching '{query}'."
                 else:
                     lines = [f"{name} (ID: {uid})" for uid, name in results.items()]
-                    tool_result = f"Found users in chat {action_chat_id}:\n" + "\n".join(lines)
+                    search_scope = f"chat {action_chat_id}" if action_chat_id else "all known chats"
+                    tool_result = f"Found users in {search_scope}:\n" + "\n".join(lines)
             else:
                 tool_result = f"Error: Unknown tool '{tool_name}'."
 
