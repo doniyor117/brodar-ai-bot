@@ -843,6 +843,8 @@ def _message_has_visual(message: Message) -> bool:
         return True
     if message.animation:
         return True
+    if message.sticker:
+        return True
     doc = message.document
     if doc and (doc.mime_type or "").startswith(("image/", "video/")):
         return True
@@ -905,6 +907,15 @@ async def _extract_visual_data_urls(message: Message, bot: Bot) -> tuple:
             thumb = await _download_file(bot, anim.thumbnail.file_id, MAX_IMAGE_BYTES)
             if thumb:
                 urls.append(_to_data_url(thumb))
+
+    # 3. Stickers
+    if message.sticker:
+        st = message.sticker
+        file_id = st.file_id if not (getattr(st, 'is_animated', False) or getattr(st, 'is_video', False)) else (st.thumbnail.file_id if getattr(st, 'thumbnail', None) else None)
+        if file_id:
+            raw = await _download_file(bot, file_id, MAX_IMAGE_BYTES)
+            if raw:
+                urls.append(_to_data_url(raw, "image/webp"))
 
     return urls, is_gif
 
@@ -981,6 +992,8 @@ async def handle_chat_message(message: Message, bot: Bot):
     # In groups it's prefixed with the speaker's name for multi-person context.
     if cleaned_text:
         text_for_model = cleaned_text
+    elif message.sticker:
+        text_for_model = "[sent a sticker]"
     elif is_gif:
         text_for_model = "[sent a gif]"
     elif has_visual:
@@ -1158,7 +1171,15 @@ async def handle_group_passive(message: Message, bot: Bot):
 
     # Log the message (attributed) so the transcript reflects it — including a
     # placeholder for image-only posts.
-    logged = text or ("[sent a gif]" if message.animation else "[sent an image]")
+    if text:
+        logged = text
+    elif message.sticker:
+        logged = "[sent a sticker]"
+    elif message.animation:
+        logged = "[sent a gif]"
+    else:
+        logged = "[sent an image]"
+        
     await cache.get_chat_history(chat_id)  # prime cache so we append, not overwrite
     cache.save_messages_async(chat_id, [{"role": "user", "content": _attribute(message, logged)}])
 
