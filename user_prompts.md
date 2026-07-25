@@ -373,3 +373,9 @@ i guess a graceful saying of output silent for bots are not working cos now its 
 ```
 we also should increase the bot to bot turn limits to 10. i confirm the plan
 ```
+
+## Prompt 48
+
+```
+hermes agent has fully implemented it. learn from it. or can we directly import that code parts to our bot?
+```
