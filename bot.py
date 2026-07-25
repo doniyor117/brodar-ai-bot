@@ -162,6 +162,48 @@ class ShouldRespondFilter(BaseFilter):
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096
 
+# ── [SILENT] sentinel token ─────────────────────────────────────────────────
+# When the model outputs this token, it has decided not to speak. The Telegram
+# sending engine catches it and sends nothing. The user's message is still saved
+# to history so the bot retains context.
+SILENT_TOKEN = "[SILENT]"
+
+# ── Bot-to-bot loop detection ──────────────────────────────────────────────
+# Server-side safety net: if recent history looks like two bots talking to each
+# other in AI-formal tone, skip the LLM call entirely to save tokens.
+BOT_LOOP_THRESHOLD = 4  # consecutive bot-looking user messages before auto-silence
+
+def _looks_like_bot_loop(history: list, threshold: int = BOT_LOOP_THRESHOLD) -> bool:
+    """Detect if recent history looks like a bot-to-bot infinite conversation."""
+    if len(history) < threshold * 2:
+        return False
+
+    recent = history[-(threshold * 2):]  # last N pairs
+
+    bot_indicators = 0
+    for msg in recent:
+        if msg["role"] == "user":
+            text = msg.get("content", "")
+            # Heuristics for AI-generated text in a casual chat context:
+            # - Starts with capital letter (brodar and humans in groups rarely do)
+            # - Contains assistant-like filler phrases
+            # - Very long for a chat message (>200 chars)
+            # - Contains bullet points or numbered lists
+            ai_markers = [
+                bool(text) and text[0].isupper(),
+                any(p in text.lower() for p in [
+                    "certainly", "i'd be happy to", "as an ai",
+                    "here's", "here is", "let me help",
+                    "is there anything else", "i can help",
+                ]),
+                len(text) > 200,
+                bool(_re.search(r"^\s*[\-\*\d]+[\.\)]\s", text, _re.MULTILINE)),
+            ]
+            if sum(ai_markers) >= 2:
+                bot_indicators += 1
+
+    return bot_indicators >= threshold - 1
+
 # Spans we must NOT lowercase: fenced code, inline code, and URLs. Everything
 # else in a conversational reply gets forced to lowercase to keep brodar in
 # character even when the flash model slips.
@@ -963,6 +1005,17 @@ async def handle_chat_message(message: Message, bot: Bot):
     user_msg_entry = {"role": "user", "content": attributed_text}
     temp_history = history + [user_msg_entry]
 
+    is_group = message.chat.type in ("group", "supergroup")
+
+    # Server-side bot-loop safety net. If recent history looks like a
+    # bot-to-bot infinite conversation, skip the LLM call entirely.
+    if is_group and _looks_like_bot_loop(history):
+        logger.info(f"Bot-loop detected in chat {chat_id}, auto-silencing.")
+        cache.save_messages_async(chat_id, [
+            {"role": "user", "content": attributed_text},
+        ])
+        return
+
     current_task = asyncio.current_task()
     if current_task:
         agent.register_running_task(chat_id, current_task)
@@ -979,6 +1032,23 @@ async def handle_chat_message(message: Message, bot: Bot):
                 image_urls=image_urls or None,
                 context_image_urls=context_image_urls or None,
             )
+
+        # ── [SILENT] interception ──────────────────────────────────────
+        if is_group and bot_reply.strip().startswith(SILENT_TOKEN):
+            # Model chose to stay silent. Save only the user's message
+            # to history (so the bot retains context) but send nothing.
+            logger.info(f"[SILENT] Model chose silence in chat {chat_id}")
+            cache.save_messages_async(chat_id, [
+                {"role": "user", "content": attributed_text},
+            ])
+            return
+
+        # Strip any accidental [SILENT] prefix in DMs (should never happen,
+        # but if it does, just remove it and send the rest).
+        if bot_reply.strip().startswith(SILENT_TOKEN):
+            bot_reply = bot_reply.strip()[len(SILENT_TOKEN):].strip()
+            if not bot_reply:
+                bot_reply = "hmm?"
 
         if config.FORCE_LOWERCASE:
             bot_reply = enforce_lowercase(bot_reply)
