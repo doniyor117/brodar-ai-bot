@@ -184,11 +184,13 @@ def _looks_like_bot_loop(history: list, threshold: int = BOT_LOOP_THRESHOLD) -> 
     for msg in recent:
         if msg["role"] == "user":
             text = msg.get("content", "")
+            
+            # Direct bot tag check
+            if text.startswith("[BOT] "):
+                bot_indicators += 1
+                continue
+                
             # Heuristics for AI-generated text in a casual chat context:
-            # - Starts with capital letter (brodar and humans in groups rarely do)
-            # - Contains assistant-like filler phrases
-            # - Very long for a chat message (>200 chars)
-            # - Contains bullet points or numbered lists
             ai_markers = [
                 bool(text) and text[0].isupper(),
                 any(p in text.lower() for p in [
@@ -1062,7 +1064,15 @@ async def handle_chat_message(message: Message, bot: Bot):
     _chat_last_msg_time[chat_id] = time.time()
     msg_time = _chat_last_msg_time[chat_id]
     
-    delay = 8.0 if message.forward_origin else 1.5
+    # If the sender is another bot, slow things down massively so humans can read
+    is_other_bot = getattr(message.from_user, "is_bot", False) if message.from_user else False
+    if message.forward_origin:
+        delay = 8.0
+    elif is_other_bot:
+        delay = 6.0
+    else:
+        delay = 1.5
+        
     await asyncio.sleep(delay)
     
     # If a newer message arrived while we slept, its handler updated the timestamp.
