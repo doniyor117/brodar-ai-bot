@@ -301,6 +301,27 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "search_group_members",
+            "description": "Searches for members (by name or username) who have recently spoken in a group chat to get their User IDs for moderation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_chat_id": {
+                        "type": "integer",
+                        "description": "Optional. The specific group chat ID to search in."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Name or username to search for. Leave empty to list all known members."
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "edit_env_file",
             "description": "Modifies the bot's .env file (environment variables). Admin-only.",
             "parameters": {
@@ -786,6 +807,15 @@ async def generate_response(
                         tool_result = await group_tools.pin_message(bot_instance, action_chat_id, msg_id)
                     else:
                         tool_result = f"Unknown moderation action '{act}'."
+            elif tool_name == "search_group_members":
+                action_chat_id = args.get("target_chat_id", chat_id)
+                query = args.get("query", "")
+                results = cache.search_users(action_chat_id, query)
+                if not results:
+                    tool_result = f"No users found in chat {action_chat_id} matching '{query}'."
+                else:
+                    lines = [f"{name} (ID: {uid})" for uid, name in results.items()]
+                    tool_result = f"Found users in chat {action_chat_id}:\n" + "\n".join(lines)
             else:
                 tool_result = f"Error: Unknown tool '{tool_name}'."
 

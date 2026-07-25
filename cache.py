@@ -23,6 +23,22 @@ HISTORY_MAXLEN = config.HISTORY_MAXLEN
 
 # Strong references to background DB-write tasks. Without this the event loop
 # only weakly references them and the GC can cancel a write before it lands.
+
+# Maps chat_id (int) -> user_id (int) -> username/full_name string
+_user_names_cache: Dict[int, Dict[int, str]] = {}
+
+def track_user(chat_id: int, user_id: int, name: str):
+    if chat_id not in _user_names_cache:
+        _user_names_cache[chat_id] = {}
+    _user_names_cache[chat_id][user_id] = name
+    
+def search_users(chat_id: int, query: str = "") -> dict:
+    if chat_id not in _user_names_cache:
+        return {}
+    if not query:
+        return _user_names_cache[chat_id]
+    q = query.lower()
+    return {uid: name for uid, name in _user_names_cache[chat_id].items() if q in name.lower() or q in str(uid)}
 _write_tasks: set = set()
 
 def _spawn_db_write(coro) -> None:

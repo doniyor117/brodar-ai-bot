@@ -947,13 +947,22 @@ async def cmd_set_title(message: Message, bot: Bot):
 
 def _speaker_name(message: Message) -> str:
     """A short display name for a group speaker."""
+    import config
     u = message.from_user
     if not u:
         return "someone"
     
     name = u.full_name or (f"@{u.username}" if u.username else str(u.id))
+    
+    # Store this user's name and ID in cache for searching later
+    cache.track_user(message.chat.id, u.id, name)
+    
     if u.is_bot:
         name = f"[BOT] {name}"
+        
+    if config.MAIN_ACCOUNT_ID and u.id == config.MAIN_ACCOUNT_ID:
+        name = f"[Master Admin] {name}"
+        
     return name
 
 
