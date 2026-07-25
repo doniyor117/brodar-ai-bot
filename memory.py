@@ -35,6 +35,16 @@ def read_persona() -> str:
         "lowercase, short like texting a friend. never say you're a language model."
     )
 
+def write_persona_md(content: str) -> bool:
+    """Overwrites the PERSONA.md file with new content."""
+    try:
+        with open(PERSONA_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        logger.error(f"Error writing to PERSONA.md: {e}")
+        return False
+
 
 def read_memory_md() -> str:
     """Reads and returns the full content of the mutable learned-facts file."""
