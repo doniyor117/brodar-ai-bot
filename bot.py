@@ -273,7 +273,7 @@ async def cmd_start(message: Message):
     """Start command handler. Casual, sarcastic and lowercase."""
     text = (
         "oh, hello. i'm brodar - an ai chat companion created by doniyor.\n"
-        "i can reply to your text, search the web, use skills, or run safe shell tools.\n"
+        "i can reply to your text, see images, watch videos, listen to audio, search the web, use skills, or run safe shell tools.\n"
         "in groups, i must be /activate-d first by an authorized user.\n"
         "type /help to see what i can do."
     )
@@ -284,7 +284,7 @@ async def cmd_help(message: Message):
     """Help command handler. Casual description of commands."""
     text = (
         "here is what you can do with me:\n"
-        "- talk normally: type anything to chat.\n"
+        "- talk normally: type text, send images/video/voice, or forward messages (i'll wait a few seconds if you want to type a follow-up command).\n"
         "- /status: view bot status, system uptime, and settings.\n"
         "- /clear: reset chat context and history.\n"
         "- /skills: list available skill instructions.\n"

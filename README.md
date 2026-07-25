@@ -173,6 +173,13 @@ The Z.ai free tier rate limits request concurrency to 1. To prevent `429` (Too M
 
 ## 7. Changelog
 
+### Multimodal Context, Forwarded Messages & Natural Human Dynamics (2026-07-25)
+* **Full Audio/Video Multimodal Context (`media.py`, `bot.py`)**: Uses `ffmpeg` to extract full audio tracks (normalized to tiny 32kbps mono mp3s) from Voice messages, Audio files, Video Notes, and Videos. Dynamically extracts evenly-spaced video frames and bundles BOTH audio and visual timelines into the LLM context (data URLs) for complete multimodal awareness. Safely skips files > 20MB.
+* **Rapid-Fire & Forwarded Debounce System**: Implemented a sliding-window debounce for chat handlers using a global timestamp tracker. Normal messages wait 1.5s, Forwarded messages wait 8.0s. If the user rapidly sends multiple messages or a follow-up to a forward, only the newest handler wakes up, effortlessly batching all immediately-saved history into a single cohesive response without duplicating LLM replies.
+* **Natural Human Typing Delays (`bot.py`)**: Calculated generation time vs a 25 char/sec fast human typing speed. The bot mathematically pauses (staying in a "typing..." state) if it generated text faster than a human could type it (clamped between 0.5s and 5.0s) for maximum realism.
+* **Smart Telegram Reactions (`bot.py`, `agent.py`)**: Trained the model (via few-shots and rules) to optionally append `|[emoji]|` syntax to responses. The bot intercepts this syntax, strips it, and natively reacts to the Telegram message.
+* **Bot-to-Bot Loop Auto-Silencing (`[SILENT]`)**: Identifies `is_bot` flags to tag messages with `[BOT]` in the LLM's history. Trained the LLM to autonomously output `[SILENT]` to end unnatural bot-to-bot loops or conversational dead-ends without invoking expensive server-side heuristics.
+
 ### Neon-Backed Memory Persistence, Global Abort & Interactive Permission Prompts (2026-07-24)
 * **Neon Postgres Memory Persistence (`memory_store`)**: `MEMORY.md` is now stored persistently in Neon Postgres. Automatically synced to local disk on app startup and updated via async write-through on every memory change, guaranteeing **100% memory persistence across Render container redeploys and restarts**.
 * **Global Emergency Abort (`/stop_all`, `/cancel_all`)**: Immediately halts all running agent tasks, LLM completions, and tool loops across **all chats globally**. Restricted to authorized bot admins.
