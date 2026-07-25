@@ -394,6 +394,31 @@ TOOLS_SCHEMA = [
                 "required": ["prompt"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_file",
+            "description": "Sends a local file (document, photo, audio, video) to the current chat.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the local file to send."
+                    },
+                    "file_type": {
+                        "type": "string",
+                        "description": "Type of file: 'document', 'photo', 'video', or 'audio'."
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional caption for the file."
+                    }
+                },
+                "required": ["file_path", "file_type"]
+            }
+        }
     }
 ]
 
@@ -848,6 +873,9 @@ async def generate_response(
                 else:
                     lines = [f"{name} (ID: {uid})" for uid, name in results.items()]
                     search_scope = f"chat {action_chat_id}" if action_chat_id else "all known chats"
+                    if len(lines) > 25:
+                        lines = lines[:25]
+                        lines.append(f"...and {len(results) - 25} more. Please refine your query.")
                     tool_result = f"Found users in {search_scope}:\n" + "\n".join(lines)
             elif tool_name == "image_generate":
                 prompt_text = args.get("prompt", "")
@@ -868,6 +896,32 @@ async def generate_response(
                     err_msg = str(e)
                     logger.error(f"Image generation failed: {err_msg}")
                     tool_result = f"Failed to generate image: {err_msg}"
+            elif tool_name == "send_file":
+                if not bot_instance or not chat_id:
+                    tool_result = "Error: send_file unavailable in this context."
+                else:
+                    file_path = args.get("file_path", "")
+                    file_type = args.get("file_type", "document")
+                    caption = args.get("caption", "")
+                    try:
+                        import os
+                        from aiogram.types import FSInputFile
+                        if not os.path.exists(file_path):
+                            tool_result = f"Error: File '{file_path}' does not exist."
+                        else:
+                            file_input = FSInputFile(file_path)
+                            if file_type == "photo":
+                                await bot_instance.send_photo(chat_id, photo=file_input, caption=caption)
+                            elif file_type == "video":
+                                await bot_instance.send_video(chat_id, video=file_input, caption=caption)
+                            elif file_type == "audio":
+                                await bot_instance.send_audio(chat_id, audio=file_input, caption=caption)
+                            else:
+                                await bot_instance.send_document(chat_id, document=file_input, caption=caption)
+                            tool_result = f"Successfully sent {file_type} from {file_path} to chat."
+                    except Exception as e:
+                        logger.error(f"Failed to send file {file_path}: {e}")
+                        tool_result = f"Failed to send file: {e}"
             else:
                 tool_result = f"Error: Unknown tool '{tool_name}'."
 
