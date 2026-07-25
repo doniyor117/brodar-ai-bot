@@ -337,3 +337,21 @@ be careful with the codebase. i confirm the plan. go ahead!
 ```
 also is it possible to identify forwarded messages? if yes it would like to implement a logic where model doesntrespond very immedietaly when received a forwarded message cos i might wanna something about it like saying whether to validate facts or just summarize . so when a forwarded message is ent either to groups or directly, the agent waits for the follow up message about it from the same sender. if someone writes between forwarded message amd the comment on what tod o from the same sender we shoul handle and think about what do to in that case
 ```
+
+## Prompt 42
+
+```
+so even if i send 8 or 10 mini messages very fast abiut in 2 seconds or 2.5 (the goldmine time) all of then are sent as batch right?
+```
+
+## Prompt 43
+
+```
+now update the start help commands and also update the session prompts file and also readme.md file too
+```
+
+## Prompt 44
+
+```
+i guess a graceful saying of output silent for bots are not working cos now its on infinite loop. bots shiuld stop after 5 turns and my bot should respond slower to bots so we can read
+```
