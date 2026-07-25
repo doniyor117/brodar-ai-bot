@@ -943,6 +943,9 @@ async def _extract_multimodal_data_urls(message: Message, bot: Bot) -> tuple:
     return urls, is_gif
 
 
+_chat_last_msg_time: dict = {}
+
+
 @router.message(ShouldRespondFilter())
 async def handle_chat_message(message: Message, bot: Bot):
     """
@@ -1043,11 +1046,33 @@ async def handle_chat_message(message: Message, bot: Bot):
         )
     if notes:
         text_for_model += "\n\n(note: " + " ".join(notes) + ")"
+        
+    if message.forward_origin:
+        text_for_model = f"[Forwarded message]\n{text_for_model}"
+        
     attributed_text = _attribute(message, text_for_model)
 
+    # Save user message to history IMMEDIATELY so follow-up messages see it in context.
+    cache.save_messages_async(chat_id, [{"role": "user", "content": attributed_text}])
+
+    # ── Rapid-fire & Forwarded Debounce ───────────────────────────
+    # If the user sends a forwarded message, wait 8 seconds for them to type a follow-up.
+    # For normal messages, wait 1.5 seconds to batch rapid-fire texts (e.g. hitting Enter multiple times).
+    import time
+    _chat_last_msg_time[chat_id] = time.time()
+    msg_time = _chat_last_msg_time[chat_id]
+    
+    delay = 8.0 if message.forward_origin else 1.5
+    await asyncio.sleep(delay)
+    
+    # If a newer message arrived while we slept, its handler updated the timestamp.
+    # We abort this generation and let the newest handler process the combined history!
+    if _chat_last_msg_time.get(chat_id) != msg_time:
+        logger.info(f"Skipping generation in chat {chat_id} because a newer message arrived.")
+        return
+
+    # Now fetch the history (which includes our immediately-saved message, plus any others).
     history = await cache.get_chat_history(chat_id)
-    user_msg_entry = {"role": "user", "content": attributed_text}
-    temp_history = history + [user_msg_entry]
 
     is_group = message.chat.type in ("group", "supergroup")
 
@@ -1055,9 +1080,6 @@ async def handle_chat_message(message: Message, bot: Bot):
     # bot-to-bot infinite conversation, skip the LLM call entirely.
     if is_group and _looks_like_bot_loop(history):
         logger.info(f"Bot-loop detected in chat {chat_id}, auto-silencing.")
-        cache.save_messages_async(chat_id, [
-            {"role": "user", "content": attributed_text},
-        ])
         return
 
     current_task = asyncio.current_task()
@@ -1071,7 +1093,7 @@ async def handle_chat_message(message: Message, bot: Bot):
         async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
             logger.info(f"Generating agent response for chat {chat_id}...")
             bot_reply = await agent.generate_response(
-                temp_history,
+                history,
                 bot_instance=bot,
                 chat_id=chat_id,
                 requester_is_privileged=privileged,
@@ -1097,12 +1119,8 @@ async def handle_chat_message(message: Message, bot: Bot):
 
         # ── [SILENT] interception ──────────────────────────────────────
         if is_group and bot_reply.strip().startswith(SILENT_TOKEN):
-            # Model chose to stay silent. Save only the user's message
-            # to history (so the bot retains context) but send nothing.
+            # Model chose to stay silent. User message is already in history.
             logger.info(f"[SILENT] Model chose silence in chat {chat_id}")
-            cache.save_messages_async(chat_id, [
-                {"role": "user", "content": attributed_text},
-            ])
             return
 
         # Strip any accidental [SILENT] prefix in DMs (should never happen,
@@ -1138,10 +1156,9 @@ async def handle_chat_message(message: Message, bot: Bot):
                 await asyncio.sleep(remaining_delay)
 
         # Persist BEFORE sending. If sending fails (e.g. formatting), the turn is
-        # still saved to history instead of being silently lost. Images aren't
-        # stored (they'd bloat history); a placeholder marks that one was sent.
+        # still saved to history instead of being silently lost. User message was
+        # already saved at the top, so we only save the assistant's reply.
         cache.save_messages_async(chat_id, [
-            {"role": "user", "content": attributed_text},
             {"role": "assistant", "content": bot_reply},
         ])
 
