@@ -94,3 +94,38 @@ def extract_video_frames(data: bytes, mode: str = "video", max_frames: int = 10,
                 logger.warning(f"ffmpeg frame extract failed at t={t:.2f}s: {e}")
 
     return frames
+
+
+def extract_audio(data: bytes, max_dim: int = 0) -> bytes:
+    """
+    Extracts and normalizes audio from video, voice, or audio bytes.
+    Converts to 32kbps mono mp3 to keep payload sizes small.
+    Returns MP3 byte string (empty if unavailable or fails).
+    """
+    exe = ffmpeg_exe()
+    if not exe:
+        logger.info("No ffmpeg available; cannot extract audio.")
+        return b""
+
+    out_bytes = b""
+    with tempfile.TemporaryDirectory() as d:
+        inp = os.path.join(d, "in_media")
+        with open(inp, "wb") as f:
+            f.write(data)
+
+        outp = os.path.join(d, "out.mp3")
+        # -vn skips video, -ac 1 forces mono, -b:a 32k for low bitrate
+        cmd = [
+            exe, "-i", inp,
+            "-vn", "-ac", "1", "-b:a", "32k",
+            "-y", outp
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=30)
+            if os.path.exists(outp) and os.path.getsize(outp) > 0:
+                with open(outp, "rb") as fr:
+                    out_bytes = fr.read()
+        except Exception as e:
+            logger.warning(f"ffmpeg audio extract failed: {e}")
+
+    return out_bytes

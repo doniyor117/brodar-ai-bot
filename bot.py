@@ -835,18 +835,16 @@ def _attribute(message: Message, text: str) -> str:
 
 MAX_IMAGE_BYTES = 4 * 1024 * 1024   # skip still images larger than 4MB
 MAX_ANIM_BYTES = 12 * 1024 * 1024   # skip animations/gifs larger than 12MB
+MAX_AUDIO_BYTES = 20 * 1024 * 1024  # skip audio/video larger than 20MB
 
-
-def _message_has_visual(message: Message) -> bool:
-    """True if a message carries something a vision model could look at."""
-    if message.photo:
+def _message_has_media(message: Message) -> bool:
+    """True if a message carries something a vision or audio model could process."""
+    if message.photo or message.animation or message.sticker:
         return True
-    if message.animation:
-        return True
-    if message.sticker:
+    if message.voice or message.audio or message.video_note or message.video:
         return True
     doc = message.document
-    if doc and (doc.mime_type or "").startswith(("image/", "video/")):
+    if doc and (doc.mime_type or "").startswith(("image/", "video/", "audio/")):
         return True
     return False
 
@@ -870,12 +868,10 @@ def _to_data_url(raw: bytes, mime: str = "image/jpeg") -> str:
     return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
 
 
-async def _extract_visual_data_urls(message: Message, bot: Bot) -> tuple:
+async def _extract_multimodal_data_urls(message: Message, bot: Bot) -> tuple:
     """
-    Collects images from a message as base64 data URLs.
-    Handles photos, image documents, and animations/GIFs (via ffmpeg frame
-    extraction, thumbnail fallback). Returns (urls, is_gif) where is_gif marks
-    that the images are frames of an animation, so the caller can tell the model.
+    Collects images and audio from a message as base64 data URLs.
+    Returns (urls, is_gif) where urls can contain both image and audio data URLs.
     """
     urls = []
     is_gif = False
@@ -891,8 +887,8 @@ async def _extract_visual_data_urls(message: Message, bot: Bot) -> tuple:
         if raw:
             urls.append(_to_data_url(raw, doc.mime_type))
 
-    # 2. Animation / GIF (silent mp4) or a video document -> extract frames
-    anim = message.animation or (doc if (doc and (doc.mime_type or "").startswith("video/")) else None)
+    # 2. Animation / GIF / Video / Video Note -> extract frames AND audio
+    anim = message.animation or message.video or message.video_note or (doc if (doc and (doc.mime_type or "").startswith("video/")) else None)
     
     is_video_sticker = message.sticker and getattr(message.sticker, 'is_video', False)
     if is_video_sticker:
@@ -900,13 +896,17 @@ async def _extract_visual_data_urls(message: Message, bot: Bot) -> tuple:
 
     if anim:
         is_gif = True
-        raw = await _download_file(bot, anim.file_id, MAX_ANIM_BYTES)
+        raw = await _download_file(bot, anim.file_id, MAX_AUDIO_BYTES)
         frames = []
+        audio_bytes = b""
         if raw:
             import media
-            # If it's a real video document, use 'video' mode. If it's an animation (GIF) or video sticker, use 'loop'.
-            mode = "video" if (doc and not message.animation and not is_video_sticker) else "loop"
+            # Frame extraction
+            mode = "video" if (getattr(anim, 'duration', 0) > 10 and not message.animation and not is_video_sticker) else "loop"
             frames = await asyncio.to_thread(media.extract_video_frames, raw, mode, 10)
+            # Audio extraction
+            audio_bytes = await asyncio.to_thread(media.extract_audio, raw)
+
         if frames:
             urls.extend(_to_data_url(fr) for fr in frames)
         elif getattr(anim, "thumbnail", None):
@@ -914,20 +914,31 @@ async def _extract_visual_data_urls(message: Message, bot: Bot) -> tuple:
             thumb = await _download_file(bot, anim.thumbnail.file_id, MAX_IMAGE_BYTES)
             if thumb:
                 urls.append(_to_data_url(thumb))
+        
+        if audio_bytes:
+            urls.append(_to_data_url(audio_bytes, "audio/mp3"))
 
     # 3. Static Stickers (Regular .webp)
     if message.sticker and not is_video_sticker:
         st = message.sticker
         if not getattr(st, 'is_animated', False):
-            # purely static sticker
             raw = await _download_file(bot, st.file_id, MAX_IMAGE_BYTES)
             if raw:
                 urls.append(_to_data_url(raw, "image/webp"))
         elif getattr(st, "thumbnail", None):
-            # Animated (.tgs) JSON sticker - fallback to static thumbnail since ffmpeg can't read JSON
             thumb = await _download_file(bot, st.thumbnail.file_id, MAX_IMAGE_BYTES)
             if thumb:
                 urls.append(_to_data_url(thumb))
+                
+    # 4. Pure Audio (Voice / Audio document)
+    audio_obj = message.voice or message.audio or (doc if (doc and (doc.mime_type or "").startswith("audio/")) else None)
+    if audio_obj:
+        raw = await _download_file(bot, audio_obj.file_id, MAX_AUDIO_BYTES)
+        if raw:
+            import media
+            audio_bytes = await asyncio.to_thread(media.extract_audio, raw)
+            if audio_bytes:
+                urls.append(_to_data_url(audio_bytes, "audio/mp3"))
 
     return urls, is_gif
 
@@ -950,10 +961,10 @@ async def handle_chat_message(message: Message, bot: Bot):
     if BOT_USERNAME:
         cleaned_text = raw_text.replace(f"@{BOT_USERNAME}", "").strip()
 
-    has_visual = _message_has_visual(message)
+    has_media = _message_has_media(message)
 
     # Nothing to do if there's neither text nor a visual.
-    if not cleaned_text and not has_visual:
+    if not cleaned_text and not has_media:
         return
 
     # Whether this sender may drive state-changing tools (persona/skill edits,
@@ -965,9 +976,9 @@ async def handle_chat_message(message: Message, bot: Bot):
     image_urls = []            # current turn's images (attached to this message)
     context_image_urls = []    # prior turns' images (chronological context block)
     is_gif = False
-    had_prior_visual = False
+    had_prior_media = False
     vision_on = False
-    if has_visual or config.VISUAL_MEMORY_TURNS > 0:
+    if has_media or config.VISUAL_MEMORY_TURNS > 0:
         vision_on = models.resolve_spec(await cache.get_active_model()).supports_vision
 
     if vision_on:
@@ -976,8 +987,8 @@ async def handle_chat_message(message: Message, bot: Bot):
         turn, last_visual_turn = await cache.bump_chat_turn(chat_id)
 
         current_urls = []
-        if has_visual:
-            current_urls, is_gif = await _extract_visual_data_urls(message, bot)
+        if has_media:
+            current_urls, is_gif = await _extract_multimodal_data_urls(message, bot)
             if current_urls:
                 await cache.remember_visuals(
                     chat_id, turn,
@@ -994,7 +1005,7 @@ async def handle_chat_message(message: Message, bot: Bot):
                 image_urls = [r["data_url"] for r in retained if r["turn"] >= turn]
                 context_image_urls = [r["data_url"] for r in retained if r["turn"] < turn]
                 is_gif = is_gif or any(r.get("is_gif") for r in retained)
-                had_prior_visual = bool(context_image_urls)
+                had_prior_media = bool(context_image_urls)
             else:
                 image_urls = current_urls
         else:
@@ -1006,24 +1017,28 @@ async def handle_chat_message(message: Message, bot: Bot):
         text_for_model = cleaned_text
     elif message.sticker:
         text_for_model = "[sent a sticker]"
+    elif message.voice or message.audio:
+        text_for_model = "[sent an audio message]"
+    elif message.video_note or message.video:
+        text_for_model = "[sent a video]"
     elif is_gif:
         text_for_model = "[sent a gif]"
-    elif has_visual:
-        text_for_model = "[sent an image]"
+    elif has_media:
+        text_for_model = "[sent media]"
     else:
         text_for_model = ""
 
     notes = []
-    if has_visual and not vision_on:
+    if has_media and not vision_on:
         notes.append(
-            "the user sent an image/gif but the current model can't see images — "
-            "tell them to switch with /model to a vision model."
+            "the user sent media (image/video/audio) but the current model can't process it — "
+            "tell them to switch with /model to a multimodal model."
         )
     if is_gif and image_urls:
-        notes.append("some attached images are still frames (first + middle) from a gif/animation.")
-    if had_prior_visual:
+        notes.append("some attached images are still frames extracted from a video/gif.")
+    if had_prior_media:
         notes.append(
-            "some attached images are from the last few messages, kept so you can answer "
+            "some attached media is from the last few messages, kept so you can answer "
             "follow-ups about them; the newest belong to the current message."
         )
     if notes:
@@ -1164,18 +1179,18 @@ async def handle_group_passive(message: Message, bot: Bot):
         return
 
     text = (message.text or message.caption or "").strip()
-    has_visual = _message_has_visual(message)
-    if not text and not has_visual:
+    has_media = _message_has_media(message)
+    if not text and not has_media:
         return
 
     # Capture images posted WITHOUT mentioning the bot, so when it's later
     # @-mentioned it can still see them (the mention-only blind spot). Only when a
     # vision model is active — otherwise there's nothing that could use them.
-    if has_visual:
+    if has_media:
         spec = models.resolve_spec(await cache.get_active_model())
         if spec.supports_vision:
             turn, _ = await cache.bump_chat_turn(chat_id)
-            urls, is_gif = await _extract_visual_data_urls(message, bot)
+            urls, is_gif = await _extract_multimodal_data_urls(message, bot)
             if urls:
                 await cache.remember_visuals(
                     chat_id, turn, [{"data_url": u, "is_gif": is_gif} for u in urls]
@@ -1187,10 +1202,14 @@ async def handle_group_passive(message: Message, bot: Bot):
         logged = text
     elif message.sticker:
         logged = "[sent a sticker]"
+    elif message.voice or message.audio:
+        logged = "[sent an audio message]"
+    elif message.video_note or message.video:
+        logged = "[sent a video]"
     elif message.animation:
         logged = "[sent a gif]"
     else:
-        logged = "[sent an image]"
+        logged = "[sent media]"
         
     await cache.get_chat_history(chat_id)  # prime cache so we append, not overwrite
     cache.save_messages_async(chat_id, [{"role": "user", "content": _attribute(message, logged)}])
