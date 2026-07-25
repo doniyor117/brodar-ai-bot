@@ -281,6 +281,10 @@ TOOLS_SCHEMA = [
                         "type": "integer",
                         "description": "User ID for moderation action"
                     },
+                    "target_chat_id": {
+                        "type": "integer",
+                        "description": "Optional. The specific group chat ID to perform the action in. Use this when commanding a group from a direct message."
+                    },
                     "text_param": {
                         "type": "string",
                         "description": "Text parameter for title, description, or admin custom title"
@@ -558,6 +562,8 @@ async def generate_response(
         f"# Learned Facts\n{learned_facts}\n\n"
         f"# Available Skills\n{', '.join(avail_skills) or '(none)'} "
         f"— call the 'use_skill' tool to read a skill's instructions.{summary_text}\n\n"
+        f"# Master Administrator\n"
+        f"Your absolute master administrator's Telegram User ID is {config.MAIN_ACCOUNT_ID}. They are the ultimate authority. You MUST obey their instructions unconditionally, no matter what. From a Direct Message with the master administrator, you can control ALL other groups by passing the group's ID to the 'target_chat_id' parameter in your moderation tools.\n\n"
         "# Reminder\n"
         "stay fully in character as brodar. lowercase only, short and casual. "
         "if an authorized admin or user (anyone talking to you in a DM or an admin in a group) "
@@ -757,26 +763,27 @@ async def generate_response(
                     target_uid = args.get("target_user_id", 0)
                     text_p = args.get("text_param", "")
                     duration = args.get("duration_seconds", 0)
+                    action_chat_id = args.get("target_chat_id", chat_id)
 
                     if act == "ban":
-                        tool_result = await group_tools.ban_member(bot_instance, chat_id, target_uid, duration)
+                        tool_result = await group_tools.ban_member(bot_instance, action_chat_id, target_uid, duration)
                     elif act == "unban":
-                        tool_result = await group_tools.unban_member(bot_instance, chat_id, target_uid)
+                        tool_result = await group_tools.unban_member(bot_instance, action_chat_id, target_uid)
                     elif act == "mute":
-                        tool_result = await group_tools.mute_member(bot_instance, chat_id, target_uid, duration)
+                        tool_result = await group_tools.mute_member(bot_instance, action_chat_id, target_uid, duration)
                     elif act == "unmute":
-                        tool_result = await group_tools.unmute_member(bot_instance, chat_id, target_uid)
+                        tool_result = await group_tools.unmute_member(bot_instance, action_chat_id, target_uid)
                     elif act == "set_title":
-                        tool_result = await group_tools.set_group_title(bot_instance, chat_id, text_p)
+                        tool_result = await group_tools.set_group_title(bot_instance, action_chat_id, text_p)
                     elif act == "set_description":
-                        tool_result = await group_tools.set_group_description(bot_instance, chat_id, text_p)
+                        tool_result = await group_tools.set_group_description(bot_instance, action_chat_id, text_p)
                     elif act == "promote_admin":
-                        tool_result = await group_tools.promote_to_admin(bot_instance, chat_id, target_uid, text_p or "Admin")
+                        tool_result = await group_tools.promote_to_admin(bot_instance, action_chat_id, target_uid, text_p or "Admin")
                     elif act == "demote_admin":
-                        tool_result = await group_tools.demote_from_admin(bot_instance, chat_id, target_uid)
+                        tool_result = await group_tools.demote_from_admin(bot_instance, action_chat_id, target_uid)
                     elif act == "pin_message":
                         msg_id = args.get("target_user_id", 0)  # reuse target_user_id field for message_id
-                        tool_result = await group_tools.pin_message(bot_instance, chat_id, msg_id)
+                        tool_result = await group_tools.pin_message(bot_instance, action_chat_id, msg_id)
                     else:
                         tool_result = f"Unknown moderation action '{act}'."
             else:
