@@ -893,29 +893,41 @@ async def _extract_visual_data_urls(message: Message, bot: Bot) -> tuple:
 
     # 2. Animation / GIF (silent mp4) or a video document -> extract frames
     anim = message.animation or (doc if (doc and (doc.mime_type or "").startswith("video/")) else None)
+    
+    is_video_sticker = message.sticker and getattr(message.sticker, 'is_video', False)
+    if is_video_sticker:
+        anim = message.sticker
+
     if anim:
         is_gif = True
         raw = await _download_file(bot, anim.file_id, MAX_ANIM_BYTES)
         frames = []
         if raw:
             import media
-            frames = await asyncio.to_thread(media.extract_video_frames, raw, 2)
+            # If it's a real video document, use 'video' mode. If it's an animation (GIF) or video sticker, use 'loop'.
+            mode = "video" if (doc and not message.animation and not is_video_sticker) else "loop"
+            frames = await asyncio.to_thread(media.extract_video_frames, raw, mode, 10)
         if frames:
             urls.extend(_to_data_url(fr) for fr in frames)
         elif getattr(anim, "thumbnail", None):
-            # Fallback: Telegram's static preview frame (no ffmpeg needed).
+            # Fallback for .tgs (Lottie JSON) animated stickers or failed extraction
             thumb = await _download_file(bot, anim.thumbnail.file_id, MAX_IMAGE_BYTES)
             if thumb:
                 urls.append(_to_data_url(thumb))
 
-    # 3. Stickers
-    if message.sticker:
+    # 3. Static Stickers (Regular .webp)
+    if message.sticker and not is_video_sticker:
         st = message.sticker
-        file_id = st.file_id if not (getattr(st, 'is_animated', False) or getattr(st, 'is_video', False)) else (st.thumbnail.file_id if getattr(st, 'thumbnail', None) else None)
-        if file_id:
-            raw = await _download_file(bot, file_id, MAX_IMAGE_BYTES)
+        if not getattr(st, 'is_animated', False):
+            # purely static sticker
+            raw = await _download_file(bot, st.file_id, MAX_IMAGE_BYTES)
             if raw:
                 urls.append(_to_data_url(raw, "image/webp"))
+        elif getattr(st, "thumbnail", None):
+            # Animated (.tgs) JSON sticker - fallback to static thumbnail since ffmpeg can't read JSON
+            thumb = await _download_file(bot, st.thumbnail.file_id, MAX_IMAGE_BYTES)
+            if thumb:
+                urls.append(_to_data_url(thumb))
 
     return urls, is_gif
 

@@ -40,9 +40,11 @@ def _probe_duration(exe: str, path: str) -> float:
     return 0.0
 
 
-def extract_video_frames(data: bytes, max_frames: int = 2, max_dim: int = 512) -> list:
+def extract_video_frames(data: bytes, mode: str = "video", max_frames: int = 10, max_dim: int = 512) -> list:
     """
-    Extract up to `max_frames` JPEG frames (first + middle) from an mp4/gif's bytes.
+    Extract JPEG frames from an mp4/gif's bytes.
+    If mode=="loop" (e.g. GIFs/Stickers), extracts 3 frames: start, middle, end.
+    If mode=="video", extracts ~1 frame every 3 seconds evenly up to max_frames.
     Frames are downscaled to <= max_dim on the long edge to keep tokens/cost down.
     Returns a list of JPEG byte strings (empty if ffmpeg is unavailable or fails).
     """
@@ -58,9 +60,20 @@ def extract_video_frames(data: bytes, max_frames: int = 2, max_dim: int = 512) -
             f.write(data)
 
         dur = _probe_duration(exe, inp)
-        if dur and dur > 0.2 and max_frames >= 2:
-            fractions = [0.0, 0.5][:max_frames]
-            times = [max(0.0, dur * fr) for fr in fractions]
+        if dur and dur > 0.1:
+            if mode == "loop":
+                # For GIFs and stickers, grab start, middle, and almost the end.
+                fractions = [0.0, 0.5, 0.9]
+                times = [dur * fr for fr in fractions]
+            else:
+                # For real videos, 1 frame per 3s evenly distributed, capped at max_frames
+                interval = 3.0
+                num_frames = min(max_frames, max(3, int(dur / interval)))
+                if num_frames <= 1:
+                    times = [dur * 0.5]
+                else:
+                    step = dur / num_frames
+                    times = [step / 2 + i * step for i in range(num_frames)]
         else:
             times = [0.0]
 
