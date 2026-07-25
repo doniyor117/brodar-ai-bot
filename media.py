@@ -82,7 +82,7 @@ def extract_video_frames(data: bytes, mode: str = "video", max_frames: int = 10,
             cmd = [
                 exe, "-ss", f"{t:.3f}", "-i", inp,
                 "-frames:v", "1",
-                "-vf", f"scale='min({max_dim},iw)':-2",
+                "-vf", f"scale='trunc(min({max_dim},iw)/2)*2':-2",
                 "-q:v", "4", "-y", outp,
             ]
             try:

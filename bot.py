@@ -8,9 +8,9 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
     Message, TelegramObject, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    InputRichMessage,
 )
 from aiogram.utils.chat_action import ChatActionSender
+import re as _re
 
 import config
 import cache
@@ -1201,6 +1201,11 @@ async def handle_chat_message(message: Message, bot: Bot):
         text_for_model = f"[Replying to {r_speaker}: '{r_text}']\n{text_for_model}"
         
     attributed_text = _attribute(message, text_for_model)
+
+    # Prime the cache from DB BEFORE appending the new message.
+    # Without this, a cold-start save creates an empty deque that
+    # shadows the database, erasing all prior context.
+    await cache.get_chat_history(chat_id)
 
     # Save user message to history IMMEDIATELY so follow-up messages see it in context.
     cache.save_messages_async(chat_id, [{"role": "user", "content": attributed_text}])
