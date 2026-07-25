@@ -291,6 +291,7 @@ TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["action"]
+            }
         }
     },
     {
