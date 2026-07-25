@@ -355,3 +355,21 @@ now update the start help commands and also update the session prompts file and 
 ```
 i guess a graceful saying of output silent for bots are not working cos now its on infinite loop. bots shiuld stop after 5 turns and my bot should respond slower to bots so we can read
 ```
+
+## Prompt 45
+
+```
+/plan ut would be great if the agent could respond to even name mentions, but wait, what if someone just mentioned for reference?
+```
+
+## Prompt 46
+
+```
+/plan btw it would be great if our agent know how to send mesaages in telegrams latest updates like now telegram supoets rich tables and formatting etc.go do comprehensive research
+```
+
+## Prompt 47
+
+```
+we also should increase the bot to bot turn limits to 10. i confirm the plan
+```
