@@ -149,8 +149,11 @@ class ShouldRespondFilter(BaseFilter):
 
         text = message.text or message.caption or ""
         
-        # Check if username is mentioned in text
-        if BOT_USERNAME and f"@{BOT_USERNAME}" in text:
+        # Check if username or name is mentioned in text
+        text_lower = text.lower()
+        if BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text_lower:
+            return True
+        if "brodar" in text_lower:
             return True
 
         # Check if the message is a reply to the bot itself
@@ -171,7 +174,7 @@ SILENT_TOKEN = "[SILENT]"
 # ── Bot-to-bot loop detection ──────────────────────────────────────────────
 # Server-side safety net: if recent history looks like two bots talking to each
 # other in AI-formal tone, skip the LLM call entirely to save tokens.
-BOT_LOOP_THRESHOLD = 4  # consecutive bot-looking user messages before auto-silence
+BOT_LOOP_THRESHOLD = 10  # consecutive bot-looking user messages before auto-silence
 
 def _looks_like_bot_loop(history: list, threshold: int = BOT_LOOP_THRESHOLD) -> bool:
     """Detect if recent history looks like a bot-to-bot infinite conversation."""
