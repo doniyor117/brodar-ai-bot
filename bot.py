@@ -1193,6 +1193,13 @@ async def handle_chat_message(message: Message, bot: Bot):
     if message.forward_origin:
         text_for_model = f"[Forwarded message]\n{text_for_model}"
         
+    if message.reply_to_message:
+        r_msg = message.reply_to_message
+        r_speaker = _speaker_name(r_msg)
+        r_text = r_msg.text or r_msg.caption or "[media]"
+        r_text = r_text[:200] + ("..." if len(r_text) > 200 else "")
+        text_for_model = f"[Replying to {r_speaker}: '{r_text}']\n{text_for_model}"
+        
     attributed_text = _attribute(message, text_for_model)
 
     # Save user message to history IMMEDIATELY so follow-up messages see it in context.
