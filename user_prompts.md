@@ -391,3 +391,100 @@ also hermes have great web search capabilities and it also soppurts exa or we ca
 ```
 lets do them all! then update help, readme and session prompts file and then give me new full set of commands ti register them in botfahter inthe way how it accepts
 ```
+
+## Prompt 51
+
+```
+/compact this session. do we have such command t
+```
+
+## Prompt 52
+
+```
+no, for agy?
+```
+
+## Prompt 53
+
+```
+/plan it looks like gemini did alot of mistakes with media related code or similar. i need you to inspect the codes for any kind of bugs so the agent works prooerly. do acomprehensive reseach on it. research on any media related stuff
+```
+
+## Prompt 54
+
+```
+/plan continue
+```
+
+## Prompt 55
+
+```
+/plan also im hitting a lot of my circuits are fried like stuff! wth is that? also group moderation amd admin management isnt working that good. he cant do simole grou search and finding ids of users! its not finding the users even if i explicitly tell the names. banning or similar ones are not working i guess or similar. gotta do more comorehensive research on it too i guess
+```
+
+## Prompt 56
+
+```
+/plan also lets give it chat or acciunt id finding skill to the agent. btw, agent shoul immedietaly read relevant skill when it was tasked with specific task. it shouldnt go with 100 char description always. you can learn this from hermes agent. now do a comprehensive research with web search too
+```
+
+## Prompt 57
+
+```
+/plan go ahead
+```
+
+## Prompt 58
+
+```
+hermes agent also has a great image generation capability configured out of the box i guess. do some research on, it would be great if we could implemet it
+```
+
+## Prompt 59
+
+```
+also you know there aresome sort of bugs with group management and admin stuff. bot is literally halting for along time or not responding when i say tosearch for or ban some or similar. i dont know whats happenig. i need you to fix any bugs related to it. also create a skill for media or file delivery to telegram chat. do some web research on them. also what skills do you recommend to install? popular good skills from web?
+```
+
+## Prompt 60
+
+```
+/plan yes, thise skills are great. but first of all, look : Doniyor:
+...
+```
+
+## Prompt 61
+
+```
+when i said ban, it was like banning frombwriting for sometime like restriction.but it went rogues. mayne we aslo should update the skill
+```
+
+## Prompt 62
+
+```
+it also should obey by all rules no matter what! in both groups or direct! no jokes with it. that playful personality should not apply to me i mean the accounts who have direct message access!
+```
+
+## Prompt 63
+
+```
+push
+```
+
+## Prompt 64
+
+```
+its rereading the skills again and again in each turn even if some of them are already in session memory!! fix this
+```
+
+## Prompt 65
+
+```
+push
+```
+
+## Prompt 66
+
+```
+i need you to update readme and session prompts file
+```

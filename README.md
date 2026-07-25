@@ -173,6 +173,13 @@ The Z.ai free tier rate limits request concurrency to 1. To prevent `429` (Too M
 
 ## 7. Changelog
 
+### Image Generation, Moderation Fixes & Admin Persona (2026-07-25)
+* **Image Generation Native Tool**: Added a robust `image_generate` tool powered by LiteLLM image API, enabling the bot to create custom AI images directly in chat.
+* **Group Moderation & Unban Links**: Refined the `group_moderation_tool` to explicitly differentiate between "banning" (kicking) and "muting" (silencing). When unbanning a user, the bot now automatically generates a temporary, single-use **invite link** and shares it with the admin, bypassing Telegram API restrictions on bot-initiated re-adds.
+* **Strict Admin & DM Compliance**: Dynamically adjusts the bot's system prompt to completely drop its sarcastic, casual persona when interacting with a privileged admin or operating within a Direct Message.
+* **Tool Loop Prevention & Stability**: Lowered the interactive approval timeout (from 5 minutes to 30 seconds) to prevent `asyncio` blocking and "circuits fried" exceptions. Optimized the `use_skill` prompt logic to prevent redundant fetching of already active skills.
+* **File Sending Skill**: Hardened the `send-media` skill to enforce pre-flight path validation (`ls`) to eliminate hallucinated file paths during delivery.
+
 ### Exa Web Search, Advanced Terminal & Interactive Approvals (2026-07-25)
 * **Exa Web Search Native Support (`tools.py`)**: Web search natively supports `exa_py` for neural-search AI web results if `EXA_API_KEY` is present in `.env`. Falls back to DuckDuckGo search automatically. No bloated plugins required.
 * **Advanced Terminal Sandbox (`tools.py`)**: The `execute_shell_command` tool now maintains a persistent `cwd` (Current Working Directory) per-chat using a `_terminal_sessions` dict, enabling native `cd` operations and persistent terminal traversal without leaving the sandbox.
