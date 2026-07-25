@@ -8,6 +8,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
     Message, TelegramObject, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    InputRichMessage,
 )
 from aiogram.utils.chat_action import ChatActionSender
 
@@ -215,6 +216,34 @@ def _looks_like_bot_loop(history: list, threshold: int = BOT_LOOP_THRESHOLD) -> 
 import re as _re
 _PROTECTED_SPAN_RE = _re.compile(r"(```.*?```|`[^`]*`|https?://\S+|www\.\S+)", _re.DOTALL)
 
+# Matches a protected region whose internal newlines must stay bare in the
+# rich-message path: a fenced code block (```...```) OR a GFM pipe-table block
+# (a header row, a delimiter row of dashes/pipes, then any pipe data rows).
+_RICH_PROTECTED_REGION_RE = _re.compile(
+    r'(?:```[^\n]*\n[\s\S]*?```)'                       # fenced code block
+    r'|(?:^[^\n]*\|[^\n]*\n'                            # table header row (has a pipe)
+    r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
+    r'(?:\n[^\n]*\|[^\n]*)*)',                          # data rows
+    _re.MULTILINE,
+)
+
+def _rich_normalize_linebreaks(text: str) -> str:
+    """Convert single `\\n` to Markdown hard breaks for the rich-message path."""
+    if not text or '\n' not in text:
+        return text
+
+    out: list[str] = []
+    pos = 0
+    for m in _RICH_PROTECTED_REGION_RE.finditer(text):
+        prose = text[pos:m.start()]
+        out.append(_re.sub(r'(?<!\n)\n(?!\n)', '  \n', prose))
+        out.append(m.group(0))  # protected region kept verbatim
+        pos = m.end()
+    tail = text[pos:]
+    out.append(_re.sub(r'(?<!\n)\n(?!\n)', '  \n', tail))
+    return ''.join(out)
+
+
 
 def enforce_lowercase(text: str) -> str:
     """Lowercases conversational text while preserving URLs and code spans."""
@@ -233,6 +262,19 @@ async def send_long_reply(message: Message, text: str) -> None:
     """
     if not text:
         text = "..."
+        
+    # Send rich message natively if the bot supports it and the text is not too long
+    # (Telegram API limits InputRichMessage markdown payload to 32768 chars)
+    if hasattr(message.bot, 'send_rich_message') and len(text) < 32768:
+        try:
+            normalized = _rich_normalize_linebreaks(text)
+            rich_msg = InputRichMessage(markdown=normalized)
+            await message.bot.send_rich_message(chat_id=message.chat.id, rich_message=rich_msg)
+            return
+        except Exception as e:
+            # Fallback to standard message chunking if send_rich_message fails
+            logger.warning(f"send_rich_message failed, falling back to standard reply: {e}")
+
     # First chunk is a reply; the rest are follow-up sends to keep ordering.
     chunks = [text[i:i + TELEGRAM_MAX_MESSAGE_LEN] for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LEN)]
     first = True
