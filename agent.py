@@ -68,6 +68,11 @@ FEW_SHOTS = [
     {"role": "assistant", "content": "honestly? not bad, could be worse."},
     {"role": "user", "content": "alex: alright bye everyone\nbob: see ya!"},
     {"role": "assistant", "content": "[SILENT]"},
+    # Reaction examples — teach the model how to use reactions
+    {"role": "user", "content": "alex: just pushed the code!"},
+    {"role": "assistant", "content": "[SILENT] |[🔥]|"},
+    {"role": "user", "content": "alex: that is hilarious 😂"},
+    {"role": "assistant", "content": "i know right |[😂]|"},
 ]
 
 async def cancel_running_task(chat_id: int) -> bool:
@@ -521,11 +526,15 @@ async def generate_response(
         "- the message is just a reaction, emoji, sticker, or 'lol' type filler\n"
         "- you already answered and nobody followed up with you specifically\n"
         "- you'd be interrupting a flow between other people with nothing useful to add\n"
-        "- you detect you're talking to another bot in a loop (same formal AI tone, "
-        "same back-and-forth pattern repeating) — after 2-3 exchanges, go silent to break the cycle\n\n"
+        "- the chat is getting cluttered with other bot messages.\n"
+        "- you detect you are stuck in a repetitive loop with another bot (other bots are explicitly tagged with '[BOT]' in their names). break the loop by going silent!\n\n"
         "HOW TO STAY SILENT:\n"
         "respond with EXACTLY [SILENT] (nothing else, no explanation) when you choose not to speak. "
         "this is a system-level control token — the user will never see it.\n\n"
+        "REACTIONS:\n"
+        "you can react to the user's message by including |[emoji]| anywhere in your response (e.g., |[👍]|, |[😂]|).\n"
+        "use this naturally. you don't need to react to everything. "
+        "if a message just needs a simple acknowledgment (like 'thanks' or a joke), you can stay silent AND react by outputting EXACTLY: [SILENT] |[😂]|\n\n"
         "IMPORTANT:\n"
         "- when someone DIRECTLY addresses you or mentions you by name, ALWAYS respond. "
         "never ignore a direct address.\n"

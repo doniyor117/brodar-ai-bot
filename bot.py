@@ -816,7 +816,11 @@ def _speaker_name(message: Message) -> str:
     u = message.from_user
     if not u:
         return "someone"
-    return u.full_name or (f"@{u.username}" if u.username else str(u.id))
+    
+    name = u.full_name or (f"@{u.username}" if u.username else str(u.id))
+    if u.is_bot:
+        name = f"[BOT] {name}"
+    return name
 
 
 def _attribute(message: Message, text: str) -> str:
@@ -1020,6 +1024,9 @@ async def handle_chat_message(message: Message, bot: Bot):
     if current_task:
         agent.register_running_task(chat_id, current_task)
 
+    import time
+    start_time = time.time()
+
     try:
         async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
             logger.info(f"Generating agent response for chat {chat_id}...")
@@ -1032,6 +1039,21 @@ async def handle_chat_message(message: Message, bot: Bot):
                 image_urls=image_urls or None,
                 context_image_urls=context_image_urls or None,
             )
+
+        # ── Reactions parsing ──────────────────────────────────────
+        reaction_match = _re.search(r'\|\[(.*?)\]\|', bot_reply)
+        emoji_reaction = None
+        if reaction_match:
+            emoji_reaction = reaction_match.group(1).strip()
+            bot_reply = bot_reply.replace(reaction_match.group(0), "").strip()
+
+        if emoji_reaction:
+            try:
+                from aiogram.types import ReactionTypeEmoji
+                await message.react(reaction=[ReactionTypeEmoji(type="emoji", emoji=emoji_reaction)])
+                logger.info(f"Bot reacted with {emoji_reaction} in chat {chat_id}")
+            except Exception as e:
+                logger.error(f"Failed to react to message in chat {chat_id}: {e}")
 
         # ── [SILENT] interception ──────────────────────────────────────
         if is_group and bot_reply.strip().startswith(SILENT_TOKEN):
@@ -1047,11 +1069,33 @@ async def handle_chat_message(message: Message, bot: Bot):
         # but if it does, just remove it and send the rest).
         if bot_reply.strip().startswith(SILENT_TOKEN):
             bot_reply = bot_reply.strip()[len(SILENT_TOKEN):].strip()
-            if not bot_reply:
+            if not bot_reply and not emoji_reaction:
                 bot_reply = "hmm?"
 
         if config.FORCE_LOWERCASE:
             bot_reply = enforce_lowercase(bot_reply)
+
+        # If the model chose silence and only wanted to react, we can just return here
+        # (This is for DMs mostly since group silences are caught earlier, but just in case)
+        if not bot_reply:
+            logger.info(f"No text to send (only reaction) in chat {chat_id}")
+            return
+
+        # Natural typing delay (Fast human: ~25 chars/sec)
+        generation_time = time.time() - start_time
+        chars_per_sec = 25.0
+        expected_typing_time = len(bot_reply) / chars_per_sec
+        
+        # Bound the delay: minimum 0.5s for realism, max 5s so we don't stall
+        expected_typing_time = max(0.5, min(expected_typing_time, 5.0))
+        
+        remaining_delay = expected_typing_time - generation_time
+        if remaining_delay > 0:
+            # We exit the ChatActionSender context block earlier, but the action
+            # stays active for a short while on the client. Let's explicitly trigger
+            # it again if the remaining delay is noticeable.
+            async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
+                await asyncio.sleep(remaining_delay)
 
         # Persist BEFORE sending. If sending fails (e.g. formatting), the turn is
         # still saved to history instead of being silently lost. Images aren't
