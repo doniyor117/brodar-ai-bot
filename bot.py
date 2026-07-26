@@ -36,8 +36,11 @@ async def handle_approval(callback: CallbackQuery):
     Resolves a privileged-tool approval prompt.
 
     AccessControlMiddleware is registered on router.message only, so callback
-    queries reach this handler with no access check whatsoever. Until this gate
-    existed, any member of a group could tap ✅ on a ban or a persona rewrite.
+    queries reach this handler with no access check whatsoever — this is the
+    only gate. The prompt itself now only ever lands in config.approval_
+    recipient_id()'s own DM (see agent._request_interactive_approval), so ONLY
+    that specific account may resolve it — not "any admin", which used to let
+    a group admin approve a card meant for doniyor specifically.
     """
     action, call_id = callback.data.split(":", 1)
 
@@ -47,16 +50,18 @@ async def handle_approval(callback: CallbackQuery):
         await callback.answer("this request is too old to confirm.", show_alert=True)
         return
 
-    if not await is_user_privileged(callback.message, callback.bot, user=callback.from_user):
+    tapper_id = callback.from_user.id if callback.from_user else None
+    recipient_id = config.approval_recipient_id()
+    if not recipient_id or tapper_id != recipient_id:
         logger.warning(
-            f"Rejected approval tap from unauthorized user {callback.from_user.id} "
-            f"in chat {callback.message.chat.id if callback.message else '?'}"
+            f"Rejected approval tap from unauthorized user {tapper_id} "
+            f"(expected {recipient_id}) for call {call_id}"
         )
-        await callback.answer("only an admin can approve this.", show_alert=True)
+        await callback.answer("this approval isn't yours to give.", show_alert=True)
         return
 
-    future = pending_approvals.pop(call_id, None)
-    if future is None:
+    entry = pending_approvals.pop(call_id, None)
+    if entry is None:
         await callback.answer("that request already expired.", show_alert=True)
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
@@ -64,18 +69,23 @@ async def handle_approval(callback: CallbackQuery):
             pass
         return
 
+    future = entry["future"] if isinstance(entry, dict) else entry
     if not future.done():
         future.set_result(action == "approve")
 
-    status_text = "✅ Approved" if action == "approve" else "❌ Denied"
+    from datetime import datetime, timezone
+    status_text = "✅ approved" if action == "approve" else "❌ denied"
     who = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.full_name
+    when = datetime.now(timezone.utc).strftime("%H:%M UTC")
     try:
+        # Edited in place rather than replaced: the DM becomes a readable audit
+        # log of every approval ever asked for, not a pile of stale buttons.
         await callback.message.edit_text(
-            f"{callback.message.text}\n\n{status_text} by {who}", reply_markup=None
+            f"{callback.message.text}\n\n{status_text} by {who} at {when}", reply_markup=None
         )
     except Exception as e:
         logger.warning(f"Failed to update approval prompt: {e}")
-    await callback.answer(f"Tool {action}d")
+    await callback.answer(f"{action.capitalize()}d")
 
 class ModelCallback(CallbackData, prefix="model"):
     """Inline-button payload for the /model picker."""
@@ -888,7 +898,15 @@ async def cmd_status(message: Message):
     # Run blocking subprocess calls off the event loop.
     uptime = (await asyncio.to_thread(tools.execute_shell_command, "uptime", "")).strip()
     ram = (await asyncio.to_thread(tools.execute_shell_command, "free", "-h")).strip()
-    
+
+    recipient = config.approval_recipient_id()
+    if config.MAIN_ACCOUNT_ID:
+        approval_line = f"- approvals go to: {config.MAIN_ACCOUNT_ID} (MAIN_ACCOUNT_ID)"
+    elif recipient:
+        approval_line = f"- approvals go to: {recipient} (fallback — MAIN_ACCOUNT_ID unset, run /setmain)"
+    else:
+        approval_line = "- approvals go to: NOWHERE — MAIN_ACCOUNT_ID and ALLOWED_DM_USER_IDS both empty, every privileged action will fail closed"
+
     text = (
         f"brodar status report:\n"
         f"- chat type: {message.chat.type}\n"
@@ -896,6 +914,7 @@ async def cmd_status(message: Message):
         f"- mention only: {mention_only}\n"
         f"- tool clues: {show_tool_notes}\n"
         f"- model: {model_label}\n"
+        f"{approval_line}\n"
         f"- uptime: {uptime}\n"
         f"- ram: {ram}"
     )
@@ -1838,6 +1857,23 @@ async def handle_chat_message(message: Message, bot: Bot, album: list = None):
         # this turn or carried over from a recent one.
         turn_mode = response_mode.classify(cleaned_text, has_media or had_prior_media)
 
+        # Who's actually asking, and where — needed for the approval card's
+        # provenance fields (Phase 9). Not the same thing as `privileged`: this
+        # is identity, not authority.
+        requester_ctx = None
+        if message.from_user:
+            requester_ctx = {
+                "user_id": message.from_user.id,
+                "username": message.from_user.username,
+                "full_name": message.from_user.full_name,
+                "message_id": message.message_id,
+            }
+        chat_ctx = {
+            "id": message.chat.id,
+            "title": getattr(message.chat, "title", None),
+            "type": message.chat.type,
+        }
+
         async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
             logger.info(f"Generating agent response for chat {chat_id} (mode={turn_mode})...")
             bot_reply = await agent.generate_response(
@@ -1850,6 +1886,8 @@ async def handle_chat_message(message: Message, bot: Bot, album: list = None):
                 context_media_items=context_media_items or None,
                 is_group=is_group,
                 mode=turn_mode,
+                requester=requester_ctx,
+                chat_info=chat_ctx,
             )
 
         if turn_mode == "extraction":

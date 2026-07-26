@@ -383,29 +383,59 @@ TOOLS_SCHEMA = [
                             "kick_ban", "unban", "mute", "unmute",
                             "set_title", "set_description",
                             "pin_message", "unpin_message",
-                            "promote_admin", "demote_admin",
+                            "promote_admin", "demote_admin", "set_custom_title",
+                            "delete_message", "delete_messages",
+                            "set_chat_permissions",
+                            "create_invite_link", "revoke_invite_link", "export_invite_link",
+                            "approve_join_request", "decline_join_request",
+                            "ban_channel", "unban_channel",
+                            "set_chat_photo", "delete_chat_photo",
+                            "get_chat_info",
+                            "create_topic", "close_topic", "reopen_topic", "delete_topic",
                         ],
                         "description": (
                             "kick_ban = remove them from the group. "
                             "mute = they stay but can't write (needs duration_seconds). "
                             "unmute/unban reverse those. "
                             "set_title/set_description change the group itself. "
-                            "pin_message/unpin_message need message_id. "
-                            "promote_admin/demote_admin change admin status."
+                            "pin_message/unpin_message need message_id; unpin_message with "
+                            "no message_id unpins everything. "
+                            "promote_admin/demote_admin change admin status; set_custom_title "
+                            "changes just an existing admin's title (text_param). "
+                            "delete_message needs message_id; delete_messages needs "
+                            "message_ids (bulk, up to 100). "
+                            "set_chat_permissions locks/unlocks the whole group at once via "
+                            "the permissions object — omitted fields default to locked. "
+                            "create_invite_link/revoke_invite_link/export_invite_link manage "
+                            "invite links. approve_join_request/decline_join_request need "
+                            "target_user_id. ban_channel/unban_channel need sender_chat_id, "
+                            "for a channel posting spam AS a channel identity, not a user. "
+                            "set_chat_photo needs file_path (a workspace-relative image); "
+                            "delete_chat_photo needs nothing. get_chat_info is read-only: "
+                            "title, description, member count, live admins. "
+                            "create_topic/close_topic/reopen_topic/delete_topic manage forum "
+                            "topics (only in chats with forum mode on) — create needs "
+                            "text_param as the name, the others need message_thread_id."
                         ),
                     },
                     "target_user_id": {
                         "type": "integer",
                         "description": (
-                            "The user to act on. REQUIRED for kick_ban, unban, mute, "
-                            "unmute, promote_admin and demote_admin. If you don't know "
+                            "The user to act on. REQUIRED for kick_ban, unban, mute, unmute, "
+                            "promote_admin, demote_admin, set_custom_title, "
+                            "approve_join_request, decline_join_request. If you don't know "
                             "it, call search_group_members first — do not guess and do "
                             "not pass 0."
                         ),
                     },
                     "message_id": {
                         "type": "integer",
-                        "description": "The message to pin or unpin. Only for pin_message / unpin_message.",
+                        "description": "One message id. For pin_message / unpin_message / delete_message.",
+                    },
+                    "message_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Multiple message ids, for delete_messages (bulk, up to 100).",
                     },
                     "target_chat_id": {
                         "type": "integer",
@@ -416,7 +446,11 @@ TOOLS_SCHEMA = [
                     },
                     "text_param": {
                         "type": "string",
-                        "description": "New group title, new description, or an admin's custom title.",
+                        "description": (
+                            "New group title/description, a custom admin title "
+                            "(promote_admin/set_custom_title), or a new forum topic's name "
+                            "(create_topic)."
+                        ),
                     },
                     "duration_seconds": {
                         "type": "integer",
@@ -424,8 +458,39 @@ TOOLS_SCHEMA = [
                             "How long a mute or kick_ban lasts. REQUIRED for mute unless "
                             "the admin explicitly asked for a permanent one. Must be at "
                             "least 31 — Telegram treats anything shorter as PERMANENT. "
-                            "Use 0 only for a deliberately permanent action."
+                            "Use 0 only for a deliberately permanent action. Also used as "
+                            "the expiry for create_invite_link (optional)."
                         ),
+                    },
+                    "permissions": {
+                        "type": "object",
+                        "description": (
+                            "For set_chat_permissions only. Maps permission names to "
+                            "true/false: can_send_messages, can_send_photos, can_send_videos, "
+                            "can_send_audios, can_send_documents, can_send_other_messages, "
+                            "can_add_web_page_previews, can_invite_users, can_pin_messages, "
+                            "can_change_info. Anything omitted defaults to false (locked)."
+                        ),
+                    },
+                    "sender_chat_id": {
+                        "type": "integer",
+                        "description": "A channel's own chat id, for ban_channel / unban_channel.",
+                    },
+                    "invite_link": {
+                        "type": "string",
+                        "description": "An existing invite link's URL, required for revoke_invite_link.",
+                    },
+                    "member_limit": {
+                        "type": "integer",
+                        "description": "Optional cap on how many people create_invite_link's link can be used by.",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Workspace-relative image path, for set_chat_photo.",
+                    },
+                    "message_thread_id": {
+                        "type": "integer",
+                        "description": "A forum topic's id, for close_topic/reopen_topic/delete_topic.",
                     },
                 },
                 "required": ["action"]
@@ -677,15 +742,65 @@ _PRIVILEGED_TOOLS = {
     # its call site below instead of blocked wholesale.
 }
 
-# Privileged tools that additionally require an explicit human approval tap.
-# Everything else in _PRIVILEGED_TOOLS is authorized by the requester already
-# being an admin — making an admin approve their own request just adds dead air.
+# Privileged tools that additionally require an explicit human approval tap,
+# regardless of who's asking — self-modification of the bot's own state.
 _APPROVAL_REQUIRED_TOOLS = {
     "edit_env_file",
     "edit_persona_file",
     "install_skill_from_url",
     "uninstall_skill",
 }
+
+# group_moderation_tool actions that touch a person or the group's membership
+# in a way that's hard to undo. Reversed from an earlier decision to skip
+# approval when the requester was already an admin (which is exactly how bans
+# and mutes fired without anyone confirming) — these ALWAYS ask, even from an
+# admin who just requested it directly. Cosmetic actions (unmute, pin, titles,
+# invite links, read-only lookups, ...) are NOT here and run immediately.
+_APPROVAL_REQUIRED_MODERATION_ACTIONS = {
+    "kick_ban", "mute", "unban", "promote_admin", "demote_admin",
+    "delete_message", "delete_messages", "set_chat_permissions", "ban_channel",
+}
+
+
+def _tool_needs_approval(tool_name: str, args: Dict[str, Any]) -> bool:
+    """
+    Whether a privileged tool call needs a human tap before it runs.
+
+    A separate function (rather than inline in the dispatch loop) so the
+    decision — which now varies by ACTION for moderation, not just by tool
+    name — is directly unit-testable.
+    """
+    if tool_name in _APPROVAL_REQUIRED_TOOLS:
+        return True
+    if tool_name == "group_moderation_tool":
+        act = (args.get("action") or "").strip().lower()
+        act = _ACTION_ALIASES.get(act, act)
+        return act in _APPROVAL_REQUIRED_MODERATION_ACTIONS
+    if tool_name == "send_file":
+        return _send_file_needs_approval(args)
+    return False
+
+
+def _send_file_needs_approval(args: Dict[str, Any]) -> bool:
+    """
+    send_file only skips the tap for files already confined to
+    workspace/downloads/ or workspace/generated/ — the bot's own output, not
+    something a human handed it a path to. Anything else leaving the sandbox
+    (an arbitrary workspace file found via the shell tool, say) still needs a
+    human to confirm before it goes out.
+    """
+    import os
+
+    resolved = _resolve_sendable_path(args.get("file_path", ""))
+    if resolved is None:
+        return True  # outside the workspace entirely — will fail anyway, but fail loud, not skip the tap
+    workspace = os.path.realpath(config.TOOL_WORKSPACE_DIR)
+    safe_dirs = (
+        os.path.join(workspace, "downloads") + os.sep,
+        os.path.join(workspace, "generated") + os.sep,
+    )
+    return not resolved.startswith(safe_dirs)
 
 
 def _tool_status_line(tool_name: str, args: Dict[str, Any]) -> str:
@@ -1063,6 +1178,8 @@ async def generate_response(
     context_media_items: Optional[List[Dict[str, Any]]] = None,
     is_group: bool = False,
     mode: str = "conversation",
+    requester: Optional[Dict[str, Any]] = None,
+    chat_info: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Generates a response from the AI Agent bot.
@@ -1130,6 +1247,15 @@ async def generate_response(
     full_messages = [{"role": "system", "content": system_prompt}]
     full_messages.extend(few_shots_for(is_group))
     full_messages.extend(chat_history)
+
+    # The most recent user turn's own text, for the approval card's "trigger"
+    # line — captured once, up front, so it's the ORIGINAL request even if the
+    # tool loop below runs several iterations before an approval is needed.
+    trigger_text = ""
+    for _msg in reversed(chat_history):
+        if _msg.get("role") == "user" and isinstance(_msg.get("content"), str):
+            trigger_text = _msg["content"]
+            break
 
     # Attach media, dropping whatever this model can't process. Prior-turn media
     # goes in as a chronological context block before the current turn; the
@@ -1242,13 +1368,15 @@ async def generate_response(
                         "content": tool_result,
                     })
                     continue
-                elif tool_name in _APPROVAL_REQUIRED_TOOLS:
-                    # Only genuinely irreversible actions get a confirmation tap.
-                    # Asking an admin to approve the moderation they *just asked
-                    # for* meant every ban/mute sat for 30s per tool loop — up to
-                    # ~3 minutes of dead air, which is what "it halts when i say
-                    # to ban" actually was.
-                    is_approved = await _request_interactive_approval(bot_instance, chat_id, tool_name, args)
+                elif _tool_needs_approval(tool_name, args):
+                    # Destructive and self-modifying actions ALWAYS get a tap,
+                    # even from an admin who just asked for it directly — the
+                    # bot must never ban or mute without someone confirming.
+                    # Cosmetic moderation (unmute, pin, set_title, ...) and
+                    # everything else skips this and runs immediately.
+                    is_approved = await _request_interactive_approval(
+                        bot_instance, chat_id, tool_name, args, requester, chat_info, trigger_text,
+                    )
                     if is_approved is not True:
                         tool_result = f"Action '{tool_name}' was not approved, so it did not run."
                         full_messages.append({
@@ -1457,8 +1585,9 @@ def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 # Which moderation actions genuinely need a user, and which need a message.
 _ACTIONS_NEEDING_USER = {
     "kick_ban", "unban", "mute", "unmute", "promote_admin", "demote_admin",
+    "set_custom_title", "approve_join_request", "decline_join_request",
 }
-_ACTIONS_NEEDING_MESSAGE = {"pin_message"}
+_ACTIONS_NEEDING_MESSAGE = {"pin_message", "delete_message"}
 
 # The old enum used "ban" for kick-and-remove, which the model kept reaching for
 # when an admin said "shut them up for ten minutes". Accepted as an alias so an
@@ -1496,6 +1625,13 @@ async def _run_moderation(bot_instance, chat_id: Optional[int], args: Dict[str, 
     text_p = args.get("text_param") or ""
     duration = _safe_int(args.get("duration_seconds"), 0) or 0
     action_chat_id = _safe_int(args.get("target_chat_id"), chat_id)
+    message_ids = args.get("message_ids") or []
+    permissions = args.get("permissions") if isinstance(args.get("permissions"), dict) else None
+    sender_chat_id = _safe_int(args.get("sender_chat_id"))
+    invite_link = args.get("invite_link") or ""
+    member_limit = _safe_int(args.get("member_limit"))
+    file_path = args.get("file_path") or ""
+    thread_id = _safe_int(args.get("message_thread_id"))
 
     if act in _ACTIONS_NEEDING_USER and (target_uid is None or target_uid <= 0):
         return (
@@ -1507,11 +1643,32 @@ async def _run_moderation(bot_instance, chat_id: Optional[int], args: Dict[str, 
     if act in _ACTIONS_NEEDING_MESSAGE and (message_id is None or message_id <= 0):
         return (
             f"Error: '{act}' needs a message_id. If the admin was replying to the "
-            "message they want pinned, use that message's id."
+            "message they meant, use that message's id."
         )
 
     if act in ("set_title", "set_description") and not text_p.strip():
         return f"Error: '{act}' needs text_param — the new {act.split('_')[1]}."
+
+    if act == "set_custom_title" and not text_p.strip():
+        return "Error: 'set_custom_title' needs text_param — the new title (max 16 chars)."
+
+    if act == "delete_messages" and not message_ids:
+        return "Error: 'delete_messages' needs message_ids — a list of message ids to delete."
+
+    if act in ("ban_channel", "unban_channel") and (sender_chat_id is None or sender_chat_id >= 0):
+        return f"Error: '{act}' needs a real sender_chat_id (a channel's own chat id, negative)."
+
+    if act == "revoke_invite_link" and not invite_link.strip():
+        return "Error: 'revoke_invite_link' needs invite_link — the link to revoke."
+
+    if act == "set_chat_photo" and not file_path.strip():
+        return "Error: 'set_chat_photo' needs file_path — a workspace-relative image path."
+
+    if act == "create_topic" and not text_p.strip():
+        return "Error: 'create_topic' needs text_param — the new topic's name."
+
+    if act in ("close_topic", "reopen_topic", "delete_topic") and (thread_id is None or thread_id <= 0):
+        return f"Error: '{act}' needs message_thread_id — which topic to act on."
 
     if act == "mute" and duration <= 0:
         # Not an error: a permanent mute is legitimate. But say what happened so
@@ -1536,16 +1693,62 @@ async def _run_moderation(bot_instance, chat_id: Optional[int], args: Dict[str, 
         )
     if act == "demote_admin":
         return await group_tools.demote_from_admin(bot_instance, action_chat_id, target_uid)
+    if act == "set_custom_title":
+        return await group_tools.set_custom_title(bot_instance, action_chat_id, target_uid, text_p)
     if act == "pin_message":
         return await group_tools.pin_message(bot_instance, action_chat_id, message_id)
     if act == "unpin_message":
         # No message_id means "unpin everything", which is a valid request.
         return await group_tools.unpin_message(bot_instance, action_chat_id, message_id)
+    if act == "delete_message":
+        return await group_tools.delete_message(bot_instance, action_chat_id, message_id)
+    if act == "delete_messages":
+        return await group_tools.delete_messages(bot_instance, action_chat_id, message_ids)
+    if act == "set_chat_permissions":
+        return await group_tools.set_chat_permissions(bot_instance, action_chat_id, permissions)
+    if act == "create_invite_link":
+        return await group_tools.create_invite_link(
+            bot_instance, action_chat_id, member_limit=member_limit,
+            expire_seconds=duration or None,
+        )
+    if act == "revoke_invite_link":
+        return await group_tools.revoke_invite_link(bot_instance, action_chat_id, invite_link)
+    if act == "export_invite_link":
+        return await group_tools.export_invite_link(bot_instance, action_chat_id)
+    if act == "approve_join_request":
+        return await group_tools.approve_join_request(bot_instance, action_chat_id, target_uid)
+    if act == "decline_join_request":
+        return await group_tools.decline_join_request(bot_instance, action_chat_id, target_uid)
+    if act == "ban_channel":
+        return await group_tools.ban_channel(bot_instance, action_chat_id, sender_chat_id)
+    if act == "unban_channel":
+        return await group_tools.unban_channel(bot_instance, action_chat_id, sender_chat_id)
+    if act == "set_chat_photo":
+        resolved = _resolve_sendable_path(file_path)
+        if resolved is None:
+            return f"Error: '{file_path}' is outside the workspace."
+        return await group_tools.set_chat_photo(bot_instance, action_chat_id, resolved)
+    if act == "delete_chat_photo":
+        return await group_tools.delete_chat_photo(bot_instance, action_chat_id)
+    if act == "get_chat_info":
+        return await group_tools.get_chat_info(bot_instance, action_chat_id)
+    if act == "create_topic":
+        return await group_tools.create_topic(bot_instance, action_chat_id, text_p)
+    if act == "close_topic":
+        return await group_tools.close_topic(bot_instance, action_chat_id, thread_id)
+    if act == "reopen_topic":
+        return await group_tools.reopen_topic(bot_instance, action_chat_id, thread_id)
+    if act == "delete_topic":
+        return await group_tools.delete_topic(bot_instance, action_chat_id, thread_id)
 
     return (
-        f"Unknown moderation action '{act}'. Valid actions: kick_ban, unban, mute, "
-        "unmute, set_title, set_description, pin_message, unpin_message, "
-        "promote_admin, demote_admin."
+        f"Unknown moderation action '{act}'. Valid actions: kick_ban, unban, mute, unmute, "
+        "set_title, set_description, pin_message, unpin_message, promote_admin, "
+        "demote_admin, set_custom_title, delete_message, delete_messages, "
+        "set_chat_permissions, create_invite_link, revoke_invite_link, "
+        "export_invite_link, approve_join_request, decline_join_request, "
+        "ban_channel, unban_channel, set_chat_photo, delete_chat_photo, "
+        "get_chat_info, create_topic, close_topic, reopen_topic, delete_topic."
     )
 
 
@@ -1747,54 +1950,194 @@ def _edit_env_file(key: str, value: str) -> str:
             
     return f"Set {key} in .env file. Note: The bot may need to be restarted to pick up environment changes."
 
-async def _request_interactive_approval(bot_instance, chat_id: int, tool_name: str, args: dict) -> bool:
+def _telegram_deep_link(chat_id: Optional[int], message_id: Optional[int]) -> Optional[str]:
     """
-    Posts an approve/deny prompt and waits for a tap. Returns True ONLY on an
-    explicit approval — a timeout, a send failure or a deny all mean False.
+    A `t.me/c/...` link to the message that triggered an approval, or None if
+    one can't be built (private chats and basic (non-super) groups don't
+    support this link shape at all).
+    """
+    if not chat_id or not message_id or chat_id >= 0:
+        return None
+    s = str(chat_id)
+    if not s.startswith("-100"):
+        return None
+    return f"https://t.me/c/{s[4:]}/{message_id}"
 
-    Fails closed by design: this previously returned an explanatory *string* on
-    timeout, and since a non-empty string is truthy the caller's `if not
-    is_approved` check passed straight through and ran the privileged tool that
-    nobody had approved.
+
+def _approval_action_label(tool_name: str, args: Dict[str, Any]) -> str:
+    """Short human label for the card's title line."""
+    if tool_name == "group_moderation_tool":
+        act = (args.get("action") or "?").strip().lower()
+        return _ACTION_ALIASES.get(act, act).replace("_", " ")
+    return tool_name.replace("_", " ")
+
+
+def _approval_detail_text(tool_name: str, args: Dict[str, Any]) -> str:
+    """The 'detail' line: what this action actually does, in plain words."""
+    import json as _json
+
+    if tool_name == "group_moderation_tool":
+        import group_tools
+        act = _ACTION_ALIASES.get((args.get("action") or "").strip().lower(), (args.get("action") or "").strip().lower())
+        duration = _safe_int(args.get("duration_seconds"), 0) or 0
+        if act in ("kick_ban", "mute"):
+            verb = "ban" if act == "kick_ban" else "mute"
+            return f"{verb} {group_tools._fmt_duration(duration)}"
+        if act in ("promote_admin", "demote_admin") and args.get("text_param"):
+            return f"custom title: {args['text_param']}"
+        return act.replace("_", " ")
+    args_str = _json.dumps({k: v for k, v in args.items() if k != "content"}, ensure_ascii=False)[:200]
+    return args_str or "(no args)"
+
+
+async def _approval_target_name(chat_id: Optional[int], tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Best-effort display name for who a moderation action targets."""
+    if tool_name != "group_moderation_tool":
+        return None
+    target_uid = _safe_int(args.get("target_user_id"))
+    if not target_uid:
+        return None
+    try:
+        rows = await cache.search_users(chat_id, str(target_uid), limit=1)
+    except Exception:
+        rows = []
+    if rows:
+        r = rows[0]
+        handle = f"@{r['username']}" if r.get("username") else "no username"
+        return f"{r.get('full_name') or '(no name)'}  {handle}  · id {target_uid}"
+    return f"id {target_uid}"
+
+
+def _build_approval_card(
+    tool_name: str, args: Dict[str, Any],
+    requester: Optional[Dict[str, Any]], chat_info: Optional[Dict[str, Any]],
+    trigger_text: str, target_name: Optional[str],
+) -> str:
+    """
+    The provenance card: who this affects, where it came from, who asked, the
+    message that triggered it, and what it actually does — so the DM reads as
+    a real audit trail instead of a bare "approve this tool call?" prompt.
+    """
+    lines = [f"⚠️ approval needed — {_approval_action_label(tool_name, args)}"]
+
+    if target_name:
+        lines.append(f"who       {target_name}")
+
+    if chat_info:
+        title = chat_info.get("title") or "(direct message)"
+        ctype = chat_info.get("type") or "?"
+        lines.append(f"where     \"{title}\"  ·  {ctype}  ·  id {chat_info.get('id')}")
+
+    if requester:
+        who = requester.get("full_name") or "someone"
+        handle = f"@{requester['username']}" if requester.get("username") else "(no username)"
+        lines.append(f"asked by  {who}  {handle}  ·  id {requester.get('user_id')}")
+
+    if trigger_text:
+        snippet = trigger_text.strip().replace("\n", " ")[:150]
+        link = _telegram_deep_link(
+            chat_info.get("id") if chat_info else None,
+            requester.get("message_id") if requester else None,
+        )
+        line = f'trigger   "{snippet}"'
+        if link:
+            line += f"  ↗ {link}"
+        lines.append(line)
+
+    detail = _approval_detail_text(tool_name, args)
+    if detail:
+        lines.append(f"detail    {detail}")
+
+    lines.append(f"expires   in {int(config.APPROVAL_TIMEOUT_SECONDS)}s — no answer means denied")
+    return "\n".join(lines)
+
+
+# Chats with an approval currently in flight. A second approval-required tool
+# call from the SAME chat while one is already pending is refused outright
+# rather than posting a duplicate DM card — the model retrying or chaining two
+# destructive actions in one turn shouldn't double the human's workload.
+_chat_pending_approvals: Set[int] = set()
+
+
+async def _request_interactive_approval(
+    bot_instance, chat_id: int, tool_name: str, args: dict,
+    requester: Optional[Dict[str, Any]] = None,
+    chat_info: Optional[Dict[str, Any]] = None,
+    trigger_text: str = "",
+) -> bool:
+    """
+    Posts an approve/deny prompt to MAIN_ACCOUNT_ID's DM (never the requesting
+    chat/group) and waits for a tap. Returns True ONLY on an explicit
+    approval — a timeout, a send failure, a missing recipient, or a deny all
+    mean False.
+
+    Fails closed by design: this previously returned an explanatory *string*
+    on timeout, and since a non-empty string is truthy the caller's `if not
+    is_approved` check passed straight through and ran the privileged tool
+    that nobody had approved.
     """
     if not bot_instance:
         return False
 
+    if chat_id in _chat_pending_approvals:
+        logger.info(f"Refusing a second concurrent approval request for chat {chat_id}.")
+        return False
+
+    recipient_id = config.approval_recipient_id()
+    if not recipient_id:
+        logger.error(
+            f"No approval recipient configured (MAIN_ACCOUNT_ID and ALLOWED_DM_USER_IDS "
+            f"both empty) — denying '{tool_name}' in chat {chat_id}."
+        )
+        await _notify(
+            bot_instance, chat_id,
+            "can't ask anyone to approve this — no admin account is configured. "
+            "an admin needs to set MAIN_ACCOUNT_ID or run /setmain.",
+        )
+        return False
+
     import uuid
-    import json
+    from aiogram.exceptions import TelegramForbiddenError
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     import bot
 
     call_id = str(uuid.uuid4())[:8]
     future = asyncio.get_running_loop().create_future()
-    bot.pending_approvals[call_id] = future
+    bot.pending_approvals[call_id] = {"future": future, "requesting_chat_id": chat_id}
+    _chat_pending_approvals.add(chat_id)
 
-    args_str = json.dumps(args, indent=2)[:300]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve:{call_id}"),
          InlineKeyboardButton(text="❌ Deny", callback_data=f"deny:{call_id}")]
     ])
 
-    # Prompt in the chat that made the request. DMing MAIN_ACCOUNT_ID instead
-    # silently failed whenever that account had never opened a DM with the bot,
-    # and the group was then told "denied" with no explanation. The callback
-    # handler authorizes the tapper, so posting here is safe.
     try:
+        target_name = await _approval_target_name(chat_id, tool_name, args)
+        card = _build_approval_card(tool_name, args, requester, chat_info, trigger_text, target_name)
         await bot_instance.send_message(
-            chat_id=chat_id,
-            text=(
-                "⚠️ **Approval Required**\n"
-                "i want to run a privileged tool. an admin needs to okay this:\n\n"
-                f"**Tool**: `{tool_name}`\n**Args**: `{args_str}`\n\n"
-                f"_expires in {int(config.APPROVAL_TIMEOUT_SECONDS)}s (no answer = denied)_"
-            ),
-            reply_markup=keyboard,
-            parse_mode="Markdown",
+            chat_id=recipient_id, text=card, reply_markup=keyboard,
         )
+    except TelegramForbiddenError:
+        # The whole reason this used to be posted in the group: a DM to
+        # MAIN_ACCOUNT_ID silently failed if that account had never opened a
+        # chat with the bot. Now it fails LOUDLY, back in the chat that asked.
+        logger.warning(f"Can't DM approval recipient {recipient_id} — they haven't started the bot.")
+        await _notify(
+            bot_instance, chat_id,
+            f"can't reach the admin in dm to confirm this — they need to /start me first. "
+            f"denying '{_approval_action_label(tool_name, args)}' for now.",
+        )
+        bot.pending_approvals.pop(call_id, None)
+        _chat_pending_approvals.discard(chat_id)
+        return False
     except Exception as e:
         logger.error(f"Failed to post approval prompt for {tool_name} in chat {chat_id}: {e}")
         bot.pending_approvals.pop(call_id, None)
+        _chat_pending_approvals.discard(chat_id)
         return False
+
+    # One line so the requesting chat isn't just silent for up to 3 minutes.
+    await _notify(bot_instance, chat_id, "asked an admin to confirm this — one sec.")
 
     try:
         approved = await asyncio.wait_for(future, timeout=config.APPROVAL_TIMEOUT_SECONDS)
@@ -1810,3 +2153,4 @@ async def _request_interactive_approval(bot_instance, chat_id: int, tool_name: s
         return False
     finally:
         bot.pending_approvals.pop(call_id, None)
+        _chat_pending_approvals.discard(chat_id)

@@ -257,3 +257,248 @@ async def demote_from_admin(bot: Bot, chat_id: int, user_id: int) -> str:
         logger.error(f"Error demoting user {user_id} in chat {chat_id}: {e}")
         return f"Failed to demote user {user_id}: {e}"
 
+
+async def delete_message(bot: Bot, chat_id: int, message_id: int) -> str:
+    """Deletes a single message."""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return f"Message {message_id} deleted."
+    except Exception as e:
+        logger.error(f"Error deleting message {message_id} in chat {chat_id}: {e}")
+        return f"Failed to delete message {message_id}: {e}"
+
+
+async def delete_messages(bot: Bot, chat_id: int, message_ids: list) -> str:
+    """
+    Deletes up to 100 messages in one call (Bot API's own cap). Falls back to
+    one-by-one deletion for a bot/aiogram version without the bulk method, so
+    this degrades gracefully instead of hard-failing.
+    """
+    ids = [i for i in (message_ids or []) if isinstance(i, int)][:100]
+    if not ids:
+        return "No valid message ids given — nothing deleted."
+    try:
+        await bot.delete_messages(chat_id=chat_id, message_ids=ids)
+        return f"Deleted {len(ids)} message(s)."
+    except AttributeError:
+        ok, failed = 0, []
+        for mid in ids:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=mid)
+                ok += 1
+            except Exception as e:
+                failed.append(mid)
+        result = f"Deleted {ok}/{len(ids)} message(s) (one at a time — bulk delete unavailable)."
+        if failed:
+            result += f" Failed: {failed}."
+        return result
+    except Exception as e:
+        logger.error(f"Error bulk-deleting {len(ids)} messages in chat {chat_id}: {e}")
+        return f"Failed to delete messages: {e}"
+
+
+async def set_chat_permissions(bot: Bot, chat_id: int, permissions: Optional[dict] = None) -> str:
+    """
+    Sets the group's default permissions for non-admin members — locking or
+    unlocking the whole chat at once. `permissions` maps ChatPermissions field
+    names (can_send_messages, can_send_photos, can_invite_users, ...) to
+    booleans; anything omitted defaults to False (locked), so "lock the group"
+    is just calling this with an empty dict.
+    """
+    try:
+        perms = types.ChatPermissions(**(permissions or {}))
+        await bot.set_chat_permissions(chat_id=chat_id, permissions=perms)
+        allowed = [k for k, v in (permissions or {}).items() if v] or ["(none — fully locked)"]
+        return f"Chat permissions updated. Allowed for members: {', '.join(allowed)}."
+    except Exception as e:
+        logger.error(f"Error setting chat permissions for chat {chat_id}: {e}")
+        return f"Failed to set chat permissions: {e}"
+
+
+async def set_custom_title(bot: Bot, chat_id: int, user_id: int, title: str) -> str:
+    """
+    Sets an existing admin's custom title on its own, without re-running the
+    whole promotion. Only works for admins the bot itself promoted, and titles
+    are capped at 16 characters by Telegram.
+    """
+    try:
+        await bot.set_chat_administrator_custom_title(
+            chat_id=chat_id, user_id=user_id, custom_title=title,
+        )
+        return f"Custom title for user {user_id} set to '{title}'."
+    except Exception as e:
+        logger.error(f"Error setting custom title for user {user_id} in chat {chat_id}: {e}")
+        return f"Failed to set custom title: {e}"
+
+
+async def create_invite_link(
+    bot: Bot, chat_id: int, member_limit: Optional[int] = None,
+    expire_seconds: Optional[int] = None, name: Optional[str] = None,
+) -> str:
+    """Creates a new (non-primary) invite link, optionally capped or time-limited."""
+    try:
+        expire_date = _until(expire_seconds) if expire_seconds else None
+        link = await bot.create_chat_invite_link(
+            chat_id=chat_id, name=name, member_limit=member_limit, expire_date=expire_date,
+        )
+        return f"Invite link created: {link.invite_link}"
+    except Exception as e:
+        logger.error(f"Error creating invite link for chat {chat_id}: {e}")
+        return f"Failed to create invite link: {e}"
+
+
+async def revoke_invite_link(bot: Bot, chat_id: int, invite_link: str) -> str:
+    """Revokes a previously created invite link."""
+    if not invite_link:
+        return "Need the invite_link to revoke — none was given."
+    try:
+        await bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=invite_link)
+        return f"Invite link revoked: {invite_link}"
+    except Exception as e:
+        logger.error(f"Error revoking invite link for chat {chat_id}: {e}")
+        return f"Failed to revoke invite link: {e}"
+
+
+async def export_invite_link(bot: Bot, chat_id: int) -> str:
+    """Returns (regenerating if needed) the group's primary invite link."""
+    try:
+        link = await bot.export_chat_invite_link(chat_id=chat_id)
+        return f"Primary invite link: {link}"
+    except Exception as e:
+        logger.error(f"Error exporting invite link for chat {chat_id}: {e}")
+        return f"Failed to export invite link: {e}"
+
+
+async def approve_join_request(bot: Bot, chat_id: int, user_id: int) -> str:
+    """Approves a pending join request."""
+    try:
+        await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
+        return f"Join request from user {user_id} approved."
+    except Exception as e:
+        logger.error(f"Error approving join request for user {user_id} in chat {chat_id}: {e}")
+        return f"Failed to approve join request: {e}"
+
+
+async def decline_join_request(bot: Bot, chat_id: int, user_id: int) -> str:
+    """Declines a pending join request."""
+    try:
+        await bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
+        return f"Join request from user {user_id} declined."
+    except Exception as e:
+        logger.error(f"Error declining join request for user {user_id} in chat {chat_id}: {e}")
+        return f"Failed to decline join request: {e}"
+
+
+async def ban_channel(bot: Bot, chat_id: int, sender_chat_id: int) -> str:
+    """Bans a channel's sender-chat identity (banChatSenderChat) — for channel-identity spam."""
+    try:
+        await bot.ban_chat_sender_chat(chat_id=chat_id, sender_chat_id=sender_chat_id)
+        return f"Channel {sender_chat_id} banned from posting as itself in this chat."
+    except Exception as e:
+        logger.error(f"Error banning channel {sender_chat_id} in chat {chat_id}: {e}")
+        return f"Failed to ban channel: {e}"
+
+
+async def unban_channel(bot: Bot, chat_id: int, sender_chat_id: int) -> str:
+    """Reverses ban_channel."""
+    try:
+        await bot.unban_chat_sender_chat(chat_id=chat_id, sender_chat_id=sender_chat_id)
+        return f"Channel {sender_chat_id} unbanned."
+    except Exception as e:
+        logger.error(f"Error unbanning channel {sender_chat_id} in chat {chat_id}: {e}")
+        return f"Failed to unban channel: {e}"
+
+
+async def set_chat_photo(bot: Bot, chat_id: int, file_path: str) -> str:
+    """Sets the group's photo from a local file (already validated/resolved by the caller)."""
+    try:
+        photo = types.FSInputFile(file_path)
+        await bot.set_chat_photo(chat_id=chat_id, photo=photo)
+        return "Chat photo updated."
+    except Exception as e:
+        logger.error(f"Error setting chat photo for chat {chat_id}: {e}")
+        return f"Failed to set chat photo: {e}"
+
+
+async def delete_chat_photo(bot: Bot, chat_id: int) -> str:
+    """Removes the group's current photo."""
+    try:
+        await bot.delete_chat_photo(chat_id=chat_id)
+        return "Chat photo removed."
+    except Exception as e:
+        logger.error(f"Error deleting chat photo for chat {chat_id}: {e}")
+        return f"Failed to delete chat photo: {e}"
+
+
+async def get_chat_info(bot: Bot, chat_id: int) -> str:
+    """
+    One read-only summary: title, type, description, member count, and the
+    live admin list — getChat + getChatMemberCount + getChatAdministrators in
+    a single tool call instead of three.
+    """
+    try:
+        chat = await bot.get_chat(chat_id)
+    except Exception as e:
+        logger.error(f"Error fetching chat info for {chat_id}: {e}")
+        return f"Failed to get chat info: {e}"
+
+    roster = await list_admins(bot, chat_id)
+    lines = [
+        f"title: {getattr(chat, 'title', None) or '(no title)'}",
+        f"type: {getattr(chat, 'type', '?')}",
+        f"id: {chat_id}",
+    ]
+    if getattr(chat, "description", None):
+        lines.append(f"description: {chat.description}")
+    if roster.get("member_count") is not None:
+        lines.append(f"member count: {roster['member_count']}")
+    if roster.get("ok") and roster["admins"]:
+        admin_names = ", ".join(
+            f"{a['full_name'] or a['user_id']}" + (f" (@{a['username']})" if a["username"] else "")
+            for a in roster["admins"]
+        )
+        lines.append(f"admins: {admin_names}")
+    return "\n".join(lines)
+
+
+async def create_topic(bot: Bot, chat_id: int, name: str) -> str:
+    """Creates a new forum topic. Only works in chats with forum mode enabled."""
+    if not name or not name.strip():
+        return "Need a name for the new topic — none was given."
+    try:
+        topic = await bot.create_forum_topic(chat_id=chat_id, name=name.strip())
+        return f"Topic '{name}' created (message_thread_id: {topic.message_thread_id})."
+    except Exception as e:
+        logger.error(f"Error creating forum topic in chat {chat_id}: {e}")
+        return f"Failed to create topic: {e}"
+
+
+async def close_topic(bot: Bot, chat_id: int, message_thread_id: int) -> str:
+    """Closes (locks) a forum topic without deleting it."""
+    try:
+        await bot.close_forum_topic(chat_id=chat_id, message_thread_id=message_thread_id)
+        return f"Topic {message_thread_id} closed."
+    except Exception as e:
+        logger.error(f"Error closing topic {message_thread_id} in chat {chat_id}: {e}")
+        return f"Failed to close topic: {e}"
+
+
+async def reopen_topic(bot: Bot, chat_id: int, message_thread_id: int) -> str:
+    """Reopens a previously closed forum topic."""
+    try:
+        await bot.reopen_forum_topic(chat_id=chat_id, message_thread_id=message_thread_id)
+        return f"Topic {message_thread_id} reopened."
+    except Exception as e:
+        logger.error(f"Error reopening topic {message_thread_id} in chat {chat_id}: {e}")
+        return f"Failed to reopen topic: {e}"
+
+
+async def delete_topic(bot: Bot, chat_id: int, message_thread_id: int) -> str:
+    """Deletes a forum topic and every message in it. Not reversible."""
+    try:
+        await bot.delete_forum_topic(chat_id=chat_id, message_thread_id=message_thread_id)
+        return f"Topic {message_thread_id} deleted."
+    except Exception as e:
+        logger.error(f"Error deleting topic {message_thread_id} in chat {chat_id}: {e}")
+        return f"Failed to delete topic: {e}"
+

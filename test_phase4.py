@@ -212,10 +212,18 @@ def test_single_approval_system():
     check("nothing imports it any more", "import permissions" not in bot_src)
     check("its unreachable callback handler is gone", "PermCallback" not in bot_src)
     check("the live approval handler survives", "async def handle_approval" in bot_src)
-    check("and it is authorized", "is_user_privileged(callback.message" in bot_src)
+    # Phase 9: authorization moved from "any admin" to specifically whoever
+    # config.approval_recipient_id() is — the prompt only ever lands in that
+    # one person's DM now, see test_phase9.py.
+    check("and it is authorized", "approval_recipient_id" in bot_src)
 
     import agent
-    check("moderation is not gated behind an approval tap",
+    # Phase 9 reverses this: destructive moderation actions (ban/mute/etc) DO
+    # now require a tap even from an admin, via the action-level
+    # _APPROVAL_REQUIRED_MODERATION_ACTIONS set rather than this whole-tool
+    # one. See test_phase9.py for the actual current gating.
+    check("moderation is not gated behind an approval tap AT THE WHOLE-TOOL LEVEL "
+          "(action-level gating replaces this in Phase 9)",
           "group_moderation_tool" not in agent._APPROVAL_REQUIRED_TOOLS)
     check("but it is still admin-only",
           "group_moderation_tool" in agent._PRIVILEGED_TOOLS)

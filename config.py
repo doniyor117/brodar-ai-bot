@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Optional
 from dotenv import load_dotenv
 
 # Load .env file if it exists (for local development)
@@ -60,7 +61,10 @@ SEARCH_POOL_SIZE = int(os.getenv("SEARCH_POOL_SIZE", "2"))
 # and Neon scales to zero — a shorter bound would fail every cold start.
 DB_ACQUIRE_TIMEOUT = float(os.getenv("DB_ACQUIRE_TIMEOUT", "30"))
 # How long an approval prompt stays live before it is treated as a DENIAL.
-APPROVAL_TIMEOUT_SECONDS = float(os.getenv("APPROVAL_TIMEOUT_SECONDS", "60"))
+# Raised from 60s: approvals now go to MAIN_ACCOUNT_ID's DM instead of the
+# requesting chat, so it needs a human in a DIFFERENT chat to notice and tap —
+# 60s was tuned for someone already looking at the conversation.
+APPROVAL_TIMEOUT_SECONDS = float(os.getenv("APPROVAL_TIMEOUT_SECONDS", "180"))
 
 # ── Addressing the bot ──────────────────────────────────────────────────────
 # Names that count as calling the bot in a mention-only group, in addition to
@@ -182,6 +186,19 @@ def is_placeholder(value: str) -> bool:
     return any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
 
 
+def approval_recipient_id() -> Optional[int]:
+    """
+    Where approval prompts are sent: MAIN_ACCOUNT_ID's DM, falling back to the
+    first ALLOWED_DM_USER_IDS entry if MAIN_ACCOUNT_ID is unset. Never the
+    group that made the request — see agent._request_interactive_approval.
+    """
+    if MAIN_ACCOUNT_ID:
+        return MAIN_ACCOUNT_ID
+    if ALLOWED_DM_USER_IDS:
+        return ALLOWED_DM_USER_IDS[0]
+    return None
+
+
 def webhook_url_is_usable() -> bool:
     """True only if WEBHOOK_URL is a real https base URL we can register with Telegram."""
     return bool(WEBHOOK_URL) and not is_placeholder(WEBHOOK_URL) and WEBHOOK_URL.startswith("https://")
@@ -216,6 +233,17 @@ def validate_config(exit_on_error: bool = True) -> list:
         problems.append("WEBHOOK_SECRET_TOKEN is still the default value; set a long random string")
     if not ALLOWED_DM_USER_IDS:
         problems.append("ALLOWED_DM_USER_IDS is empty; nobody will be able to DM or activate the bot")
+
+    # Not fatal — approval_recipient_id() falls back to ALLOWED_DM_USER_IDS[0] —
+    # but worth a loud warning, since a silently-wrong fallback is exactly what
+    # sent approvals to the group in the first place. See /status.
+    if not MAIN_ACCOUNT_ID:
+        print(
+            "WARNING: MAIN_ACCOUNT_ID is not set. Approval prompts will fall back to "
+            f"the first ALLOWED_DM_USER_IDS entry ({ALLOWED_DM_USER_IDS[0] if ALLOWED_DM_USER_IDS else 'none — approvals will fail closed'}). "
+            "Run /setmain to fix this.",
+            file=sys.stderr,
+        )
 
     if problems:
         print("=" * 72, file=sys.stderr)
