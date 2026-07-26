@@ -1309,15 +1309,15 @@ async def _extract_from_video(
 
         # Only touch audio if the probe actually saw an audio stream.
         if info.has_audio:
-            audio = await media.extract_audio(path, config.MEDIA_MAX_AUDIO_SECONDS)
+            audio, audio_mime = await media.extract_audio(path, config.MEDIA_MAX_AUDIO_SECONDS)
             if audio:
                 result.items.append(media.MediaItem(
-                    data_url=_to_data_url(audio, "audio/mp3"), kind="audio",
+                    data_url=_to_data_url(audio, audio_mime), kind="audio",
                 ))
             if info.duration > config.MEDIA_MAX_AUDIO_SECONDS:
                 result.notes.append(
-                    f"only the first {int(config.MEDIA_MAX_AUDIO_SECONDS // 60)} "
-                    f"minutes of the audio were listened to"
+                    f"that's {int(info.duration // 60)} min of audio, i heard "
+                    f"the first {int(config.MEDIA_MAX_AUDIO_SECONDS // 60)} min of it"
                 )
     finally:
         try:
@@ -1438,11 +1438,19 @@ async def _extract_one_message(message: Message, bot: Bot, result) -> None:
         else:
             path = await media.write_temp(raw, suffix=".bin")
             try:
-                converted = await media.extract_audio(path, config.MEDIA_MAX_AUDIO_SECONDS)
+                converted, converted_mime = await media.extract_audio(path, config.MEDIA_MAX_AUDIO_SECONDS)
                 if converted:
                     result.items.append(media.MediaItem(
-                        data_url=_to_data_url(converted, "audio/mp3"), kind="audio",
+                        data_url=_to_data_url(converted, converted_mime), kind="audio",
                     ))
+                    # Voice/Audio objects carry their own duration from Telegram —
+                    # no probe() needed to know if the clip got cut short.
+                    src_duration = getattr(audio_obj, "duration", 0) or 0
+                    if src_duration > config.MEDIA_MAX_AUDIO_SECONDS:
+                        result.notes.append(
+                            f"that's {int(src_duration // 60)} min of audio, i heard "
+                            f"the first {int(config.MEDIA_MAX_AUDIO_SECONDS // 60)} min of it"
+                        )
                 else:
                     result.notes.append("couldn't read that audio")
             finally:

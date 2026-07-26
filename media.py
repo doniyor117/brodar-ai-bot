@@ -34,7 +34,11 @@ DEFAULT_MAX_DIM = 384
 # Absolute ceiling on ffmpeg wall time per invocation.
 PROBE_TIMEOUT = 20.0
 FRAMES_TIMEOUT = 120.0
-AUDIO_TIMEOUT = 120.0
+AUDIO_TIMEOUT = 150.0
+# If 16kHz mono FLAC comes out bigger than this (an unusually long or noisy
+# clip), fall back to a lossy 96kbps encode rather than risk overrunning the
+# turn's media byte budget or Gemini's 20MB inline request cap.
+AUDIO_FLAC_MAX_BYTES = 8 * 1024 * 1024
 
 
 @dataclass
@@ -218,39 +222,80 @@ async def extract_frames(
         return frames[:count]
 
 
-async def extract_audio(path: str, max_seconds: float = 0.0) -> bytes:
+async def extract_audio(path: str, max_seconds: float = 0.0) -> tuple:
     """
-    Normalize a file's audio to a small mono mp3.
+    Normalize a file's audio to 16kHz mono FLAC — lossless, natively supported
+    by Gemini's audio understanding, and small at the rate a speech model
+    actually works at (~8-10 KB/s for speech). Telegram voice notes are Opus;
+    the previous approach re-encoded that to 32kbps mono MP3, a lossy transcode
+    of an already-lossy source that smeared exactly the consonant detail a
+    speech model needs — which is why Uzbek speech was coming back as Turkish
+    or as invented words.
+
+    Falls back to a 96kbps mono MP3 (still 16kHz, still far better than the old
+    32kbps) if the FLAC result overruns AUDIO_FLAC_MAX_BYTES, so an unusually
+    long or noisy clip can't blow the turn's media byte budget.
 
     `max_seconds` caps the encoded length. Without a cap, a one-hour voice note
     became ~19MB of base64 that was then re-sent to the model on every turn for
     the whole retention window.
+
+    Returns (data, mime) — mime is "" alongside b"" on total failure, so the
+    data URL built from it always reflects what was actually encoded rather
+    than a hard-coded guess.
     """
     exe = ffmpeg_exe()
     if not exe:
-        return b""
+        return b"", ""
 
     with tempfile.TemporaryDirectory() as d:
-        outp = os.path.join(d, "out.mp3")
-        cmd = [exe, "-hide_banner", "-loglevel", "error", "-i", path]
-        if max_seconds and max_seconds > 0:
-            cmd += ["-t", f"{max_seconds:.2f}"]
-        cmd += ["-vn", "-ac", "1", "-b:a", "32k", "-y", outp]
+        def _cmd(outp: str, *audio_args: str) -> List[str]:
+            c = [exe, "-hide_banner", "-loglevel", "error", "-i", path]
+            if max_seconds and max_seconds > 0:
+                c += ["-t", f"{max_seconds:.2f}"]
+            c += ["-vn", "-ar", "16000", "-ac", "1", *audio_args, "-y", outp]
+            return c
 
-        rc, _, err = await _run(cmd, AUDIO_TIMEOUT)
+        flac_path = os.path.join(d, "out.flac")
+        rc, _, err = await _run(_cmd(flac_path, "-c:a", "flac"), AUDIO_TIMEOUT)
 
         try:
-            if os.path.exists(outp) and os.path.getsize(outp) > 0:
-                with open(outp, "rb") as f:
-                    return f.read()
+            size = os.path.getsize(flac_path) if os.path.exists(flac_path) else 0
+        except Exception:
+            size = 0
+
+        if size > 0:
+            if size <= AUDIO_FLAC_MAX_BYTES:
+                try:
+                    with open(flac_path, "rb") as f:
+                        return f.read(), "audio/flac"
+                except Exception as e:
+                    logger.warning(f"Could not read extracted FLAC audio: {e}")
+            else:
+                logger.info(
+                    f"FLAC audio came out {size} bytes, over the {AUDIO_FLAC_MAX_BYTES} "
+                    "budget; falling back to a 96kbps mp3 encode."
+                )
+        else:
+            logger.warning(
+                f"FLAC audio extraction produced nothing (rc={rc}): "
+                f"{err.decode('utf-8', 'replace')[:400]}"
+            )
+
+        mp3_path = os.path.join(d, "out.mp3")
+        rc2, _, err2 = await _run(_cmd(mp3_path, "-b:a", "96k"), AUDIO_TIMEOUT)
+        try:
+            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                with open(mp3_path, "rb") as f:
+                    return f.read(), "audio/mp3"
         except Exception as e:
-            logger.warning(f"Could not read extracted audio: {e}")
+            logger.warning(f"Could not read extracted mp3 audio fallback: {e}")
 
         logger.warning(
-            f"Audio extraction produced nothing (rc={rc}): "
-            f"{err.decode('utf-8', 'replace')[:400]}"
+            f"Audio extraction produced nothing at all (flac rc={rc}, mp3 rc={rc2}): "
+            f"{err2.decode('utf-8', 'replace')[:400]}"
         )
-        return b""
+        return b"", ""
 
 
 def frame_count_for(duration: float, max_frames: int, seconds_per_frame: float) -> int:

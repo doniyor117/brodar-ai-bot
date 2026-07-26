@@ -731,6 +731,39 @@ def _media_block(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {"type": "image_url", "image_url": {"url": url}}
 
 
+_SPEECH_LANGUAGE_LABELS = {
+    "uz-latn": "Uzbek (Latin script)",
+    "uz-cyrl": "Uzbek (Cyrillic script)",
+    "ru": "Russian",
+    "en": "English",
+}
+
+
+def _speech_language_hint() -> str:
+    """
+    Prompt-only language hint injected on any turn carrying audio.
+
+    There is no `languageCode` parameter on Gemini's generateContent — the
+    prompt is the only channel — and a hint measurably improves accuracy on
+    multilingual/accented audio. Also states plainly that Uzbek isn't Turkish,
+    since that was the single most common failure: the model would "correct"
+    an unfamiliar Uzbek word into the nearest Turkish one it actually knew.
+    """
+    codes = [c.strip() for c in config.SPEECH_LANGUAGES.split(",") if c.strip()]
+    names = [_SPEECH_LANGUAGE_LABELS.get(c.lower(), c) for c in codes] or ["English"]
+    lang_list = ", ".join(names)
+    return (
+        "# Audio Language Hint\n"
+        f"this audio is most likely one of: {lang_list} — sometimes code-switching "
+        "mid-sentence between them. transcribe whatever language is actually being "
+        "spoken, in its own script. uzbek is NOT turkish — they are different "
+        "languages, do not \"correct\" an unfamiliar uzbek word into the nearest "
+        "turkish one. if a word or phrase is genuinely unclear, write `[unclear]` "
+        "instead of inventing a plausible-sounding word. name the language(s) you "
+        "actually heard."
+    )
+
+
 def _media_blocks(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Content blocks for a list of media items, order preserved."""
     blocks = []
@@ -1094,17 +1127,31 @@ async def generate_response(
     _insert_context_media(full_messages, prior)
     _attach_media_to_last_user(full_messages, current)
 
+    if any(i.get("kind") == "audio" for i in current + prior):
+        full_messages.append({"role": "system", "content": _speech_language_hint()})
+
     if dropped:
         # Say it out loud rather than silently answering as if nothing arrived —
         # a non-vision model receiving a photo used to just... not mention it.
-        what = " and ".join(sorted(dropped))
-        full_messages.append({
-            "role": "system",
-            "content": (
-                f"the user sent {what}, but the current model ({spec.label}) can't "
-                f"process {what}. tell them to switch with /model to a model that can."
-            ),
-        })
+        if "audio" in dropped:
+            full_messages.append({
+                "role": "system",
+                "content": (
+                    f"the user sent audio, but the current model ({spec.label}) can't "
+                    "hear it. tell them plainly, in your own voice: switch me to gemini "
+                    "and i'll actually listen — say to use /model and pick a gemini option."
+                ),
+            })
+        other_dropped = dropped - {"audio"}
+        if other_dropped:
+            what = " and ".join(sorted(other_dropped))
+            full_messages.append({
+                "role": "system",
+                "content": (
+                    f"the user sent {what}, but the current model ({spec.label}) can't "
+                    f"process {what}. tell them to switch with /model to a model that can."
+                ),
+            })
 
     max_tool_loops = 6
     # Low temperature for extraction turns only — greedy decoding suppresses

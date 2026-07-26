@@ -109,8 +109,16 @@ MEDIA_SECONDS_PER_FRAME = float(os.getenv("MEDIA_SECONDS_PER_FRAME", "3"))
 MEDIA_LOOP_FRAMES = int(os.getenv("MEDIA_LOOP_FRAMES", "3"))
 # Long edge, in pixels, of an extracted frame.
 MEDIA_FRAME_MAX_DIM = int(os.getenv("MEDIA_FRAME_MAX_DIM", "384"))
-# Longest stretch of audio transcribed from one file.
-MEDIA_MAX_AUDIO_SECONDS = float(os.getenv("MEDIA_MAX_AUDIO_SECONDS", "300"))
+# Longest stretch of audio transcribed from one file. 16kHz mono FLAC (see
+# media.extract_audio) runs ~8-10 KB/s, so 600s is ~5-6MB raw — comfortably
+# inside Gemini's 20MB inline request cap even before the fallback MP3 path.
+MEDIA_MAX_AUDIO_SECONDS = float(os.getenv("MEDIA_MAX_AUDIO_SECONDS", "600"))
+# Languages to hint the model toward when a turn carries audio, most-likely
+# first. There is no `languageCode` parameter on Gemini's generateContent —
+# the prompt is the only channel, and an explicit hint measurably improves
+# accuracy on multilingual/accented audio (see response_mode.py's neighbour,
+# the language-hint block in agent.generate_response).
+SPEECH_LANGUAGES = os.getenv("SPEECH_LANGUAGES", "uz-Latn,uz-Cyrl,ru,en")
 # Most images that may be attached to a single request, current turn included.
 MEDIA_MAX_ITEMS_PER_TURN = int(os.getenv("MEDIA_MAX_ITEMS_PER_TURN", "12"))
 # Ceiling on the total encoded size of one turn's media, in bytes of base64.
