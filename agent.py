@@ -621,17 +621,70 @@ async def _notify(bot_instance: Optional[Any], chat_id: Optional[int], text: str
         logger.warning(f"Failed to send tool-status note to chat {chat_id}: {e}")
 
 
-def _image_blocks(urls: List[str]) -> List[Dict[str, Any]]:
-    return [{"type": "image_url", "image_url": {"url": u}} for u in urls]
+def _media_block(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Build the right OpenAI/LiteLLM content block for one piece of media.
+
+    Images and audio are NOT interchangeable. Images use `image_url`; Gemini
+    inline audio uses a `file` block carrying a data: URL
+    (https://docs.litellm.ai/docs/providers/gemini). Everything used to be
+    wrapped as `image_url`, which is why the bot never understood a single voice
+    note — it was handed an mp3 and told it was a picture.
+
+    Note there is no `video_url` shortcut for Gemini via LiteLLM
+    (BerriAI/litellm#30501), so frame extraction remains the only way to show it
+    a video.
+    """
+    url = item.get("data_url")
+    if not url:
+        return None
+    if item.get("kind") == "audio":
+        return {"type": "file", "file": {"file_data": url}}
+    return {"type": "image_url", "image_url": {"url": url}}
 
 
-def _attach_images_to_last_user(full_messages: List[Dict[str, Any]], image_urls: List[str]) -> None:
+def _media_blocks(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Content blocks for a list of media items, order preserved."""
+    blocks = []
+    for item in items:
+        block = _media_block(item)
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def filter_media_for_model(
+    items: List[Dict[str, Any]], spec: "models.ModelSpec"
+) -> tuple:
+    """
+    Split media into (sendable, dropped_kinds) for the active model.
+
+    Returns the items this model can actually process plus the set of kinds that
+    had to be dropped, so the caller can tell the user to switch models instead
+    of the request silently doing nothing.
+    """
+    sendable, dropped = [], set()
+    for item in items:
+        kind = item.get("kind", "image")
+        if kind == "audio" and not getattr(spec, "supports_audio", False):
+            dropped.add("audio")
+            continue
+        if kind == "image" and not spec.supports_vision:
+            dropped.add("image")
+            continue
+        sendable.append(item)
+    return sendable, dropped
+
+
+def _attach_media_to_last_user(full_messages: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> None:
     """
     Rewrites the last user message into OpenAI-style multimodal content blocks
-    (text first, then its images), which LiteLLM forwards to vision models.
-    Ordering matters: the text (the user's question) comes before the image(s)
-    it refers to, and images are appended in the order given.
+    (text first, then its media), which LiteLLM forwards to the provider.
+    Ordering matters: the text (the user's question) comes before the media it
+    refers to, and media is appended in the order given.
     """
+    if not items:
+        return
     for msg in reversed(full_messages):
         if msg.get("role") == "user":
             text = msg.get("content") or ""
@@ -640,24 +693,24 @@ def _attach_images_to_last_user(full_messages: List[Dict[str, Any]], image_urls:
             blocks: List[Dict[str, Any]] = []
             if text:
                 blocks.append({"type": "text", "text": text})
-            blocks.extend(_image_blocks(image_urls))
+            blocks.extend(_media_blocks(items))
             msg["content"] = blocks
             return
 
 
-def _insert_context_images(full_messages: List[Dict[str, Any]], image_urls: List[str]) -> None:
+def _insert_context_media(full_messages: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> None:
     """
-    Inserts prior-turn images as their own user message immediately BEFORE the
+    Inserts prior-turn media as its own user message immediately BEFORE the
     current turn, in chronological (oldest-first) order. This preserves the real
     sequence — earlier images stay earlier in the conversation instead of being
     lumped onto the latest message where their order would be lost.
     """
-    if not image_urls:
+    if not items:
         return
     blocks: List[Dict[str, Any]] = [
-        {"type": "text", "text": "(images shared earlier in this chat, oldest first, for context)"}
+        {"type": "text", "text": "(media shared earlier in this chat, oldest first, for context)"}
     ]
-    blocks.extend(_image_blocks(image_urls))
+    blocks.extend(_media_blocks(items))
     ctx_msg = {"role": "user", "content": blocks}
     # Insert just before the last message (the current user turn).
     insert_at = max(0, len(full_messages) - 1)
@@ -801,8 +854,8 @@ async def generate_response(
     chat_id: Optional[int] = None,
     requester_is_privileged: bool = False,
     show_tool_notes: bool = True,
-    image_urls: Optional[List[str]] = None,
-    context_image_urls: Optional[List[str]] = None,
+    media_items: Optional[List[Dict[str, Any]]] = None,
+    context_media_items: Optional[List[Dict[str, Any]]] = None,
     is_group: bool = False,
 ) -> str:
     """
@@ -822,9 +875,11 @@ async def generate_response(
     ([SILENT], reactions, speaker-name prefixes) is omitted entirely in DMs
     rather than sent-then-contradicted.
 
-    `image_urls` are data: URLs for attached images; they are only sent to the
-    model if the active model supports vision, otherwise they're dropped and the
-    model is told it can't see images.
+    `media_items` are this turn's media as {"data_url", "kind", "is_gif"} dicts;
+    `context_media_items` are retained items from earlier turns. Each is sent
+    only if the active model supports that kind — images need vision, audio
+    needs audio — and anything dropped is reported to the model so it can tell
+    the user to switch with /model instead of ignoring the request.
     """
     # Resolve the active model once for this whole turn.
     spec = models.resolve_spec(await cache.get_active_model())
@@ -862,20 +917,25 @@ async def generate_response(
     full_messages.extend(few_shots_for(is_group))
     full_messages.extend(chat_history)
 
-    # Attach images — only if the active model can actually see them. Prior-turn
-    # images go in as a chronological context block before the current turn; the
-    # current message's own images stay attached to it (order preserved).
-    if spec.supports_vision:
-        if context_image_urls:
-            _insert_context_images(full_messages, context_image_urls)
-        if image_urls:
-            _attach_images_to_last_user(full_messages, image_urls)
-    elif image_urls or context_image_urls:
+    # Attach media, dropping whatever this model can't process. Prior-turn media
+    # goes in as a chronological context block before the current turn; the
+    # current message's own media stays attached to it (order preserved).
+    current, dropped = filter_media_for_model(media_items or [], spec)
+    prior, dropped_prior = filter_media_for_model(context_media_items or [], spec)
+    dropped |= dropped_prior
+
+    _insert_context_media(full_messages, prior)
+    _attach_media_to_last_user(full_messages, current)
+
+    if dropped:
+        # Say it out loud rather than silently answering as if nothing arrived —
+        # a non-vision model receiving a photo used to just... not mention it.
+        what = " and ".join(sorted(dropped))
         full_messages.append({
             "role": "system",
             "content": (
-                f"the user sent image(s), but the current model ({spec.label}) can't "
-                "see images. tell them to switch to a vision model with /model."
+                f"the user sent {what}, but the current model ({spec.label}) can't "
+                f"process {what}. tell them to switch with /model to a model that can."
             ),
         })
 

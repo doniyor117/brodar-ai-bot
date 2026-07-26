@@ -23,6 +23,12 @@ class ModelSpec:
     litellm_model: str       # the string passed to litellm (e.g. "gemini/gemini-3.5-flash-lite")
     api_key_env: str         # env var holding this provider's key
     supports_vision: bool    # whether images may be attached
+    # Whether inline audio may be attached. Distinct from vision: a model that
+    # can see images cannot necessarily hear, and sending audio to one that
+    # can't is worse than dropping it — it either errors or gets silently
+    # misread. Nothing tracked this before, and audio was sent to every vision
+    # model as if it were a picture.
+    supports_audio: bool = False
     api_base: Optional[str] = None  # custom endpoint (for OpenAI-compatible providers like Z.ai)
 
     @property
@@ -67,20 +73,24 @@ MODELS: Dict[str, ModelSpec] = {
         api_key_env="ZAI_API_KEY",
         api_base="https://api.z.ai/api/paas/v4",
         supports_vision=False,
+        supports_audio=False,
     ),
     "gemini-3.5-flash-lite": ModelSpec(
         key="gemini-3.5-flash-lite",
-        label="Gemini 3.5 Flash-Lite · vision",
+        label="Gemini 3.5 Flash-Lite · vision + audio",
         litellm_model="gemini/gemini-3.5-flash-lite",
         api_key_env="GEMINI_API_KEY",
         supports_vision=True,
+        # Gemini accepts inline audio through LiteLLM as a "file" content block.
+        supports_audio=True,
     ),
     "gemini-3.1-flash-lite": ModelSpec(
         key="gemini-3.1-flash-lite",
-        label="Gemini 3.1 Flash-Lite · vision",
+        label="Gemini 3.1 Flash-Lite · vision + audio",
         litellm_model="gemini/gemini-3.1-flash-lite",
         api_key_env="GEMINI_API_KEY",
         supports_vision=True,
+        supports_audio=True,
     ),
 }
 

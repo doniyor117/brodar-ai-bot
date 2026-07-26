@@ -93,8 +93,30 @@ COMPACT_MIN_KEEP_MESSAGES = int(os.getenv("COMPACT_MIN_KEEP_MESSAGES", "8"))
 # follow-up questions before it's dropped. 0 disables (send-once). Each retained
 # image is re-sent every turn in its window, so keep this modest for token cost.
 VISUAL_MEMORY_TURNS = int(os.getenv("VISUAL_MEMORY_TURNS", "8"))
-# Hard cap on how many images may be attached to a single request (safety).
+# Hard cap on how many RETAINED images from *earlier* turns may be re-attached.
 VISUAL_MEMORY_MAX_IMAGES = int(os.getenv("VISUAL_MEMORY_MAX_IMAGES", "5"))
+
+# ── Media extraction budgets ────────────────────────────────────────────────
+# The retention cap above must NOT be used to cap the current turn. It used to
+# be: a video producing 10 frames was stored and then read back with
+# "ORDER BY id DESC LIMIT 5", silently throwing away the first 60% of the video
+# the user had just sent. These are separate numbers for separate jobs.
+#
+# Frames to pull from one video, and roughly how far apart.
+MEDIA_MAX_FRAMES = int(os.getenv("MEDIA_MAX_FRAMES", "10"))
+MEDIA_SECONDS_PER_FRAME = float(os.getenv("MEDIA_SECONDS_PER_FRAME", "3"))
+# Frames for a short looping clip (gif, video sticker, video note).
+MEDIA_LOOP_FRAMES = int(os.getenv("MEDIA_LOOP_FRAMES", "3"))
+# Long edge, in pixels, of an extracted frame.
+MEDIA_FRAME_MAX_DIM = int(os.getenv("MEDIA_FRAME_MAX_DIM", "384"))
+# Longest stretch of audio transcribed from one file.
+MEDIA_MAX_AUDIO_SECONDS = float(os.getenv("MEDIA_MAX_AUDIO_SECONDS", "300"))
+# Most images that may be attached to a single request, current turn included.
+MEDIA_MAX_ITEMS_PER_TURN = int(os.getenv("MEDIA_MAX_ITEMS_PER_TURN", "12"))
+# Ceiling on the total encoded size of one turn's media, in bytes of base64.
+MEDIA_MAX_TURN_BYTES = int(os.getenv("MEDIA_MAX_TURN_BYTES", str(12 * 1024 * 1024)))
+# How long to wait for the rest of a Telegram album before answering it.
+MEDIA_ALBUM_WINDOW = float(os.getenv("MEDIA_ALBUM_WINDOW", "1.2"))
 
 # Database configurations
 DATABASE_URL = os.getenv("DATABASE_URL", "")

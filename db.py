@@ -28,7 +28,8 @@ SCHEMA_STATEMENTS = [
     # used to age out retained visuals without extra queries.
     "ALTER TABLE chats ADD COLUMN IF NOT EXISTS msg_turn INTEGER DEFAULT 0 NOT NULL",
     "ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_visual_turn INTEGER DEFAULT 0 NOT NULL",
-    # Recently-sent images/GIF frames, kept for a few turns for follow-up vision.
+    # Recently-sent media (images, extracted video frames, audio), kept for a few
+    # turns so follow-up questions about them still work.
     """
     CREATE TABLE IF NOT EXISTS recent_visuals (
         id SERIAL PRIMARY KEY,
@@ -39,6 +40,9 @@ SCHEMA_STATEMENTS = [
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
     )
     """,
+    # "image" or "audio". Without it, audio rows were indistinguishable from
+    # image rows on read-back and got rebuilt as image content blocks.
+    "ALTER TABLE recent_visuals ADD COLUMN IF NOT EXISTS kind VARCHAR(16) DEFAULT 'image' NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_recent_visuals_chat_turn ON recent_visuals (chat_id, turn)",
     """
     CREATE TABLE IF NOT EXISTS messages (
@@ -314,7 +318,7 @@ async def bump_turn(chat_id: int) -> Dict[str, int]:
 
 
 async def add_recent_visuals(chat_id: int, turn: int, items: List[Dict[str, Any]]) -> None:
-    """Stores this turn's visuals and marks it as the chat's last visual turn."""
+    """Stores this turn's media and marks it as the chat's last visual turn."""
     if not items:
         return
     pool = get_pool()
@@ -322,8 +326,10 @@ async def add_recent_visuals(chat_id: int, turn: int, items: List[Dict[str, Any]
         async with conn.transaction():
             for it in items:
                 await conn.execute(
-                    "INSERT INTO recent_visuals (chat_id, turn, data_url, is_gif) VALUES ($1, $2, $3, $4)",
+                    "INSERT INTO recent_visuals (chat_id, turn, data_url, is_gif, kind) "
+                    "VALUES ($1, $2, $3, $4, $5)",
                     chat_id, turn, it["data_url"], bool(it.get("is_gif")),
+                    it.get("kind") or "image",
                 )
             await conn.execute(
                 "UPDATE chats SET last_visual_turn = $2 WHERE chat_id = $1",
@@ -332,12 +338,21 @@ async def add_recent_visuals(chat_id: int, turn: int, items: List[Dict[str, Any]
 
 
 async def fetch_recent_visuals(chat_id: int, min_turn: int, limit: int) -> List[Dict[str, Any]]:
-    """Returns retained visuals with turn >= min_turn, oldest first, capped at `limit`."""
+    """
+    Retained media from turns STRICTLY BEFORE `before_turn` is the caller's job
+    to filter; this returns everything with turn >= min_turn, oldest first,
+    capped at `limit`.
+
+    The cap applies to retained history only. It must never be used to cap the
+    current turn's own media: this is "ORDER BY id DESC LIMIT n", so applying a
+    limit of 5 to a video that produced 10 frames kept only the LAST five and
+    silently discarded the beginning of the clip the user had just sent.
+    """
     pool = get_pool()
     async with pool.acquire(timeout=config.DB_ACQUIRE_TIMEOUT) as conn:
         rows = await conn.fetch(
             """
-            SELECT data_url, is_gif, turn FROM recent_visuals
+            SELECT data_url, is_gif, turn, kind FROM recent_visuals
             WHERE chat_id = $1 AND turn >= $2
             ORDER BY id DESC
             LIMIT $3
@@ -349,13 +364,31 @@ async def fetch_recent_visuals(chat_id: int, min_turn: int, limit: int) -> List[
 
 
 async def prune_recent_visuals(chat_id: int, min_turn: int) -> None:
-    """Deletes visuals older than the retention window for a chat."""
+    """Deletes media older than the retention window for a chat."""
     pool = get_pool()
     async with pool.acquire(timeout=config.DB_ACQUIRE_TIMEOUT) as conn:
         await conn.execute(
             "DELETE FROM recent_visuals WHERE chat_id = $1 AND turn < $2",
             chat_id, min_turn,
         )
+
+
+async def clear_recent_visuals(chat_id: int) -> None:
+    """
+    Drops every retained visual for a chat and resets its turn counters.
+
+    /clear did neither, so a "fresh start" immediately re-attached images from
+    before the clear — the user wiped the history and the bot kept talking about
+    the old pictures.
+    """
+    pool = get_pool()
+    async with pool.acquire(timeout=config.DB_ACQUIRE_TIMEOUT) as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM recent_visuals WHERE chat_id = $1", chat_id)
+            await conn.execute(
+                "UPDATE chats SET msg_turn = 0, last_visual_turn = 0 WHERE chat_id = $1",
+                chat_id,
+            )
 
 
 async def delete_old_messages(chat_id: int, keep_last_n: int) -> int:

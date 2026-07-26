@@ -222,13 +222,37 @@ async def remember_visuals(chat_id: int, turn: int, items: list) -> None:
         logger.error(f"remember_visuals failed for chat {chat_id}: {e}")
 
 async def recall_visuals(chat_id: int, min_turn: int, limit: int) -> list:
-    """Prunes expired visuals, then returns those still within the retention window."""
+    """Prunes expired media, then returns what's still within the retention window."""
     try:
         await db.prune_recent_visuals(chat_id, max(1, min_turn))
         return await db.fetch_recent_visuals(chat_id, min_turn, limit)
     except Exception as e:
         logger.error(f"recall_visuals failed for chat {chat_id}: {e}")
         return []
+
+
+async def prune_visuals(chat_id: int, min_turn: int) -> None:
+    """
+    Drop media that has aged out, without reading anything back.
+
+    Pruning used to happen ONLY inside recall_visuals, which the passive
+    group handler never calls — so in a mention-only group, multi-megabyte
+    base64 rows accumulated in Postgres forever. Same when the retention window
+    lapses with no new media: nothing read, so nothing pruned.
+    """
+    try:
+        await db.prune_recent_visuals(chat_id, max(1, min_turn))
+    except Exception as e:
+        logger.error(f"prune_visuals failed for chat {chat_id}: {e}")
+
+
+async def clear_visuals(chat_id: int) -> None:
+    """Drops all retained media for a chat and resets its turn counters."""
+    try:
+        await db.clear_recent_visuals(chat_id)
+    except Exception as e:
+        logger.error(f"clear_visuals failed for chat {chat_id}: {e}")
+    _turn_fallback.pop(chat_id, None)
 
 def invalidate_history(chat_id: int) -> None:
     """

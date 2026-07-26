@@ -138,7 +138,55 @@ class AccessControlMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-# Register the outer middleware on the router
+class AlbumMiddleware(BaseMiddleware):
+    """
+    Collapse a Telegram album into a single handler call.
+
+    An album (several photos sent at once) is delivered as N independent
+    updates that share a `media_group_id`. Handled one at a time, five photos
+    became five turns, five debounce cycles, five history entries and five
+    reply attempts — and one album consumed the entire visual-memory window.
+
+    The first message of a group waits a short beat for its siblings, then runs
+    the handler once with `album` in the handler data; the others are dropped.
+    This is the standard aiogram-3 pattern (cf. aiogram-media-group).
+    """
+    def __init__(self, window: float = None):
+        self.window = window if window is not None else config.MEDIA_ALBUM_WINDOW
+        self._groups: dict = {}
+
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        # media_group_id only exists on a Message, so anything else falls
+        # straight through — no isinstance check needed.
+        group_id = getattr(event, "media_group_id", None)
+        if not group_id:
+            return await handler(event, data)
+
+        message = event
+
+        bucket = self._groups.get(group_id)
+        if bucket is not None:
+            # A sibling is already collecting; hand it this message and stop.
+            bucket.append(message)
+            return
+
+        bucket = [message]
+        self._groups[group_id] = bucket
+        try:
+            await asyncio.sleep(self.window)
+            # Caption can be on any member of the album; run the handler on the
+            # one that carries it so the user's text isn't lost.
+            album = list(bucket)
+            lead = next((m for m in album if (m.text or m.caption)), album[0])
+            data["album"] = album
+            return await handler(lead, data)
+        finally:
+            self._groups.pop(group_id, None)
+
+
+# Register the outer middlewares on the router. Album batching runs first so a
+# whole album reaches the access check (and the handler) as one event.
+router.message.outer_middleware(AlbumMiddleware())
 router.message.outer_middleware(AccessControlMiddleware())
 
 # Global cache for the bot's own username to prevent redundant API calls
@@ -764,6 +812,10 @@ async def cmd_clear(message: Message, bot: Bot):
         return
     chat_id = message.chat.id
     await cache.clear_chat_history(chat_id)
+    # Retained media and the turn counters are part of the context too. Clearing
+    # only the text meant a "fresh start" immediately re-attached images from
+    # before the clear, and the bot kept answering about them.
+    await cache.clear_visuals(chat_id)
     await message.reply("cleared conversation context for this chat. fresh start.")
 
 @router.message(Command("skills"))
@@ -1151,6 +1203,7 @@ MAX_IMAGE_BYTES = 4 * 1024 * 1024   # skip still images larger than 4MB
 MAX_ANIM_BYTES = 12 * 1024 * 1024   # skip animations/gifs larger than 12MB
 MAX_AUDIO_BYTES = 20 * 1024 * 1024  # skip audio/video larger than 20MB
 
+
 def _message_has_media(message: Message) -> bool:
     """True if a message carries something a vision or audio model could process."""
     if message.photo or message.animation or message.sticker:
@@ -1163,98 +1216,267 @@ def _message_has_media(message: Message) -> bool:
     return False
 
 
-async def _download_file(bot: Bot, file_id: str, max_bytes: int) -> bytes:
-    """Downloads a Telegram file to bytes, or returns b'' if too big / on error."""
+async def _download_file(bot: Bot, file_id: str, max_bytes: int) -> tuple:
+    """
+    Download a Telegram file to bytes.
+
+    Returns (data, reason) where reason is a short user-facing explanation when
+    data is empty. The old version returned b"" for both "too big" and "network
+    error", so an oversized file produced total silence with no way for the user
+    to know why.
+
+    Note the size guard now fails CLOSED: Telegram omits file_size for some
+    types, and treating "unknown" as "fine" meant the limit didn't apply to
+    exactly the files most likely to be huge. We download, then check.
+    """
     try:
         f = await bot.get_file(file_id)
         if f.file_size and f.file_size > max_bytes:
-            logger.info(f"Skipping file {file_id}: {f.file_size} bytes over limit.")
-            return b""
+            logger.info(f"Skipping file {file_id}: {f.file_size} bytes over the {max_bytes} limit.")
+            return b"", f"that file's too big ({f.file_size // (1024 * 1024)}MB)"
+
         buf = io.BytesIO()
         await bot.download_file(f.file_path, destination=buf)
-        return buf.getvalue()
+        data = buf.getvalue()
+
+        if len(data) > max_bytes:
+            logger.info(f"Discarding file {file_id} after download: {len(data)} bytes over limit.")
+            return b"", f"that file's too big ({len(data) // (1024 * 1024)}MB)"
+        return data, ""
     except Exception as e:
         logger.warning(f"Failed to download file {file_id}: {e}")
-        return b""
+        return b"", "couldn't download that one"
 
 
 def _to_data_url(raw: bytes, mime: str = "image/jpeg") -> str:
     return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
 
 
-async def _extract_multimodal_data_urls(message: Message, bot: Bot) -> tuple:
+async def _extract_from_video(
+    bot: Bot, obj, result, *, loop_style: bool, label: str
+) -> None:
     """
-    Collects images and audio from a message as base64 data URLs.
-    Returns (urls, is_gif) where urls can contain both image and audio data URLs.
-    """
-    urls = []
-    is_gif = False
+    Pull frames (and audio, if there is any) out of one video-ish object.
 
-    # 1. Still images (photo or image document)
-    if message.photo:
-        raw = await _download_file(bot, message.photo[-1].file_id, MAX_IMAGE_BYTES)
-        if raw:
-            urls.append(_to_data_url(raw))
+    `loop_style` marks short looping clips — GIFs, video stickers, video notes —
+    which get a handful of frames rather than one every few seconds.
+
+    Everything is probed first. That single probe replaces two guesses the old
+    code made and got wrong: it used getattr(obj, "duration", 0), which is
+    always 0 on a Document, so an hour-long mp4 sent as a file got exactly 3
+    frames; and it ran a full audio extraction pass on every GIF and video
+    sticker, which are always silent, burning a temp dir and a process to
+    produce nothing every single time.
+    """
+    import media
+
+    raw, reason = await _download_file(bot, obj.file_id, MAX_AUDIO_BYTES)
+    if not raw:
+        if reason:
+            result.notes.append(reason)
+        # Static thumbnail is better than nothing (also covers .tgs stickers).
+        await _fallback_to_thumbnail(bot, obj, result)
+        return
+
+    path = await media.write_temp(raw, suffix=".bin")
+    try:
+        info = await media.probe(path)
+
+        if info.has_video or not info.ok:
+            if loop_style:
+                count = config.MEDIA_LOOP_FRAMES
+            else:
+                count = media.frame_count_for(
+                    info.duration, config.MEDIA_MAX_FRAMES, config.MEDIA_SECONDS_PER_FRAME
+                )
+            frames = await media.extract_frames(
+                path, count,
+                max_dim=config.MEDIA_FRAME_MAX_DIM,
+                duration=info.duration,
+            )
+            for fr in frames:
+                result.items.append(media.MediaItem(
+                    data_url=_to_data_url(fr), kind="image", is_gif=True,
+                ))
+            if not frames:
+                logger.info(f"No frames extracted from {label}; falling back to thumbnail.")
+                await _fallback_to_thumbnail(bot, obj, result)
+
+        # Only touch audio if the probe actually saw an audio stream.
+        if info.has_audio:
+            audio = await media.extract_audio(path, config.MEDIA_MAX_AUDIO_SECONDS)
+            if audio:
+                result.items.append(media.MediaItem(
+                    data_url=_to_data_url(audio, "audio/mp3"), kind="audio",
+                ))
+            if info.duration > config.MEDIA_MAX_AUDIO_SECONDS:
+                result.notes.append(
+                    f"only the first {int(config.MEDIA_MAX_AUDIO_SECONDS // 60)} "
+                    f"minutes of the audio were listened to"
+                )
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+async def _fallback_to_thumbnail(bot: Bot, obj, result) -> None:
+    """Use an object's static thumbnail when real extraction produced nothing."""
+    import media
+
+    thumb = getattr(obj, "thumbnail", None)
+    if not thumb:
+        return
+    raw, _ = await _download_file(bot, thumb.file_id, MAX_IMAGE_BYTES)
+    if raw:
+        result.items.append(media.MediaItem(
+            data_url=_to_data_url(raw), kind="image", is_gif=True,
+        ))
+
+
+async def extract_media(messages, bot: Bot):
+    """
+    Collect every piece of media from one turn's message(s) as MediaItems.
+
+    Takes a LIST because a Telegram album arrives as N separate updates that all
+    belong to one user action; the album middleware batches them so five photos
+    become one turn with five images instead of five turns each burning a slot
+    of the retention window.
+
+    Each item is extracted independently inside its own try, so one corrupt file
+    can no longer take down the whole batch (and with it the reply).
+    """
+    import media
+
+    result = media.ExtractionResult()
+
+    for message in messages:
+        try:
+            await _extract_one_message(message, bot, result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Media extraction failed for one message: {e}", exc_info=True)
+            result.notes.append("one of those files broke on the way in")
+
+    _apply_media_budget(result)
+    return result
+
+
+async def _extract_one_message(message: Message, bot: Bot, result) -> None:
+    """Extract every piece of media attached to a single message."""
+    import media
+
     doc = message.document
-    if doc and (doc.mime_type or "").startswith("image/"):
-        raw = await _download_file(bot, doc.file_id, MAX_IMAGE_BYTES)
-        if raw:
-            urls.append(_to_data_url(raw, doc.mime_type))
+    doc_mime = (doc.mime_type or "") if doc else ""
 
-    # 2. Animation / GIF / Video / Video Note -> extract frames AND audio
-    anim = message.animation or message.video or message.video_note or (doc if (doc and (doc.mime_type or "").startswith("video/")) else None)
-    
-    is_video_sticker = message.sticker and getattr(message.sticker, 'is_video', False)
+    # 1. Still images (photo, or an image sent as a document).
+    if message.photo:
+        raw, reason = await _download_file(bot, message.photo[-1].file_id, MAX_IMAGE_BYTES)
+        if raw:
+            result.items.append(media.MediaItem(data_url=_to_data_url(raw), kind="image"))
+        elif reason:
+            result.notes.append(reason)
+
+    if doc and doc_mime.startswith("image/"):
+        raw, reason = await _download_file(bot, doc.file_id, MAX_IMAGE_BYTES)
+        if raw:
+            result.items.append(media.MediaItem(data_url=_to_data_url(raw, doc_mime), kind="image"))
+        elif reason:
+            result.notes.append(reason)
+
+    # 2. Video-ish: animation/GIF, video, video note, video sticker, video doc.
+    is_video_sticker = bool(message.sticker and getattr(message.sticker, "is_video", False))
+    video_obj = (
+        message.animation
+        or message.video
+        or message.video_note
+        or (doc if doc and doc_mime.startswith("video/") else None)
+    )
     if is_video_sticker:
-        anim = message.sticker
+        video_obj = message.sticker
 
-    if anim:
-        is_gif = True
-        raw = await _download_file(bot, anim.file_id, MAX_AUDIO_BYTES)
-        frames = []
-        audio_bytes = b""
-        if raw:
-            import media
-            # Frame extraction
-            mode = "video" if (getattr(anim, 'duration', 0) > 10 and not message.animation and not is_video_sticker) else "loop"
-            frames = await asyncio.to_thread(media.extract_video_frames, raw, mode, 10)
-            # Audio extraction
-            audio_bytes = await asyncio.to_thread(media.extract_audio, raw)
+    if video_obj is not None:
+        # Animations, video notes and stickers are short loops; a real video or a
+        # video document is sampled across its length.
+        loop_style = bool(message.animation or message.video_note or is_video_sticker)
+        await _extract_from_video(
+            bot, video_obj, result,
+            loop_style=loop_style,
+            label="animation" if loop_style else "video",
+        )
 
-        if frames:
-            urls.extend(_to_data_url(fr) for fr in frames)
-        elif getattr(anim, "thumbnail", None):
-            # Fallback for .tgs (Lottie JSON) animated stickers or failed extraction
-            thumb = await _download_file(bot, anim.thumbnail.file_id, MAX_IMAGE_BYTES)
-            if thumb:
-                urls.append(_to_data_url(thumb))
-        
-        if audio_bytes:
-            urls.append(_to_data_url(audio_bytes, "audio/mp3"))
-
-    # 3. Static Stickers (Regular .webp)
+    # 3. Static stickers (.webp), and animated .tgs via their thumbnail.
     if message.sticker and not is_video_sticker:
         st = message.sticker
-        if not getattr(st, 'is_animated', False):
-            raw = await _download_file(bot, st.file_id, MAX_IMAGE_BYTES)
+        if not getattr(st, "is_animated", False):
+            raw, _ = await _download_file(bot, st.file_id, MAX_IMAGE_BYTES)
             if raw:
-                urls.append(_to_data_url(raw, "image/webp"))
-        elif getattr(st, "thumbnail", None):
-            thumb = await _download_file(bot, st.thumbnail.file_id, MAX_IMAGE_BYTES)
-            if thumb:
-                urls.append(_to_data_url(thumb))
-                
-    # 4. Pure Audio (Voice / Audio document)
-    audio_obj = message.voice or message.audio or (doc if (doc and (doc.mime_type or "").startswith("audio/")) else None)
-    if audio_obj:
-        raw = await _download_file(bot, audio_obj.file_id, MAX_AUDIO_BYTES)
-        if raw:
-            import media
-            audio_bytes = await asyncio.to_thread(media.extract_audio, raw)
-            if audio_bytes:
-                urls.append(_to_data_url(audio_bytes, "audio/mp3"))
+                result.items.append(media.MediaItem(
+                    data_url=_to_data_url(raw, "image/webp"), kind="image",
+                ))
+        else:
+            await _fallback_to_thumbnail(bot, st, result)
 
-    return urls, is_gif
+    # 4. Pure audio: voice note, music file, or an audio document.
+    audio_obj = (
+        message.voice
+        or message.audio
+        or (doc if doc and doc_mime.startswith("audio/") else None)
+    )
+    if audio_obj is not None:
+        raw, reason = await _download_file(bot, audio_obj.file_id, MAX_AUDIO_BYTES)
+        if not raw:
+            if reason:
+                result.notes.append(reason)
+        else:
+            path = await media.write_temp(raw, suffix=".bin")
+            try:
+                converted = await media.extract_audio(path, config.MEDIA_MAX_AUDIO_SECONDS)
+                if converted:
+                    result.items.append(media.MediaItem(
+                        data_url=_to_data_url(converted, "audio/mp3"), kind="audio",
+                    ))
+                else:
+                    result.notes.append("couldn't read that audio")
+            finally:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+
+def _apply_media_budget(result) -> None:
+    """
+    Enforce the per-turn item and byte budgets, keeping audio first.
+
+    Audio survives truncation ahead of frames because it carries the words —
+    losing a frame costs a glimpse, losing the audio costs the entire message.
+    Truncation is reported so the model can say so instead of confidently
+    answering about a video it only half saw.
+    """
+    max_items = config.MEDIA_MAX_ITEMS_PER_TURN
+    max_bytes = config.MEDIA_MAX_TURN_BYTES
+
+    audio = [i for i in result.items if i.kind == "audio"]
+    images = [i for i in result.items if i.kind != "audio"]
+
+    kept, total, dropped = [], 0, 0
+    for item in audio + images:
+        if len(kept) >= max_items or total + item.size() > max_bytes:
+            dropped += 1
+            continue
+        kept.append(item)
+        total += item.size()
+
+    if dropped:
+        logger.info(f"Media budget dropped {dropped} of {len(result.items)} items.")
+        result.notes.append("that was a lot of media, so only part of it came through")
+
+    # Restore the original order among what survived, so frames stay sequential.
+    order = {id(i): n for n, i in enumerate(result.items)}
+    result.items = sorted(kept, key=lambda i: order[id(i)])
 
 
 # Debounce bookkeeping, keyed (chat_id, user_id) -> last message timestamp.
@@ -1271,13 +1493,18 @@ def _prune_debounce_keys() -> None:
 
 
 @router.message(ShouldRespondFilter())
-async def handle_chat_message(message: Message, bot: Bot):
+async def handle_chat_message(message: Message, bot: Bot, album: list = None):
     """
     General message handler that handles conversational response generation.
     Appends messages to the history cache and calls the LLM agent.
     Registers task in agent._running_tasks to support emergency /stop cancellation.
+
+    `album` is injected by AlbumMiddleware when this message is part of a
+    multi-photo album; `message` is then the member carrying the caption and
+    `album` holds every member, so the whole album is one turn.
     """
     chat_id = message.chat.id
+    batch = album or [message]
     raw_text = message.text or message.caption or ""
 
     global BOT_USERNAME
@@ -1296,7 +1523,7 @@ async def handle_chat_message(message: Message, bot: Bot):
             _re.escape(f"@{BOT_USERNAME}"), spoken_name, raw_text, flags=_re.IGNORECASE
         ).strip()
 
-    has_media = _message_has_media(message)
+    has_media = any(_message_has_media(m) for m in batch)
 
     # Nothing to do if there's neither text nor a visual.
     if not cleaned_text and not has_media:
@@ -1316,51 +1543,77 @@ async def handle_chat_message(message: Message, bot: Bot):
     # there propagated to main.py's catch-all, which logs and swallows it:
     # no reply, no error message, the bot simply appeared dead.
     try:
+        # Claim the debounce slot BEFORE any slow work. Extracting a two-minute
+        # video takes real time, and the timestamp used to be stamped after it —
+        # so a follow-up text would replace this message in the slot, reply
+        # first, and then this handler would wake up and reply a second time to
+        # the same conversation. Stamping here means the newer message wins.
+        debounce_key = (chat_id, message.from_user.id if message.from_user else 0)
+        msg_time = time.time()
+        _chat_last_msg_time[debounce_key] = msg_time
+        _prune_debounce_keys()
+
         # Whether this sender may drive state-changing tools (persona/skill edits,
         # group moderation). Checked once here and passed into the agent.
         privileged = await is_user_privileged(message, bot)
         show_tool_notes = await cache.get_chat_tool_notes(chat_id)
 
-        # Vision handling. Only bother if the active model can actually see images.
-        image_urls = []            # current turn's images (attached to this message)
-        context_image_urls = []    # prior turns' images (chronological context block)
-        is_gif = False
+        # ── Media ──────────────────────────────────────────────────────
+        # The whole batch (an album is several messages, one turn) is extracted
+        # once, tagged by kind, stored, and then read back together with anything
+        # retained from recent turns.
+        media_items = []           # this turn's media, attached to this message
+        context_media_items = []   # earlier turns' media, as a context block
+        extraction_notes = []
+        this_turn_is_gif = False
         had_prior_media = False
-        vision_on = False
-        if has_media or config.VISUAL_MEMORY_TURNS > 0:
-            vision_on = models.resolve_spec(await cache.get_active_model()).supports_vision
 
-        if vision_on:
-            # Advance the per-chat turn counter (drives visual aging). Returns the last
-            # turn that carried a visual, so we know whether to look for retained images.
+        spec = models.resolve_spec(await cache.get_active_model())
+        can_take_media = spec.supports_vision or spec.supports_audio
+
+        if can_take_media:
+            # Advance the per-chat turn counter (drives media aging). Returns the
+            # last turn that carried media, so we know whether to look for more.
             turn, last_visual_turn = await cache.bump_chat_turn(chat_id)
 
-            current_urls = []
+            current = []
             if has_media:
-                current_urls, is_gif = await _extract_multimodal_data_urls(message, bot)
-                if current_urls:
-                    await cache.remember_visuals(
-                        chat_id, turn,
-                        [{"data_url": u, "is_gif": is_gif} for u in current_urls],
-                    )
+                # Show typing during extraction too — downloading and decoding a
+                # video takes seconds, and without this the chat looks dead for
+                # all of them.
+                async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
+                    result = await extract_media(batch, bot)
+                current = [
+                    {"data_url": i.data_url, "kind": i.kind, "is_gif": i.is_gif}
+                    for i in result.items
+                ]
+                extraction_notes = list(result.notes)
+                this_turn_is_gif = any(i.is_gif for i in result.items)
+                if current:
+                    await cache.remember_visuals(chat_id, turn, current)
                     last_visual_turn = turn
+
+            # This turn's own media is NEVER subject to the retention cap — that
+            # cap is "keep the newest N rows", so applying it here threw away the
+            # start of a video the user had literally just sent.
+            media_items = current
 
             if config.VISUAL_MEMORY_TURNS > 0:
                 min_turn = turn - config.VISUAL_MEMORY_TURNS + 1
-                # Only touch the visuals table if something is actually in the window.
                 if last_visual_turn >= min_turn:
-                    retained = await cache.recall_visuals(chat_id, min_turn, config.VISUAL_MEMORY_MAX_IMAGES)
-                    # Keep chronological order; split "this turn" from earlier turns.
-                    image_urls = [r["data_url"] for r in retained if r["turn"] >= turn]
-                    context_image_urls = [r["data_url"] for r in retained if r["turn"] < turn]
-                    is_gif = is_gif or any(r.get("is_gif") for r in retained)
-                    had_prior_media = bool(context_image_urls)
+                    retained = await cache.recall_visuals(
+                        chat_id, min_turn, config.VISUAL_MEMORY_MAX_IMAGES + len(current)
+                    )
+                    context_media_items = [r for r in retained if r["turn"] < turn]
+                    context_media_items = context_media_items[-config.VISUAL_MEMORY_MAX_IMAGES:]
+                    had_prior_media = bool(context_media_items)
                 else:
-                    image_urls = current_urls
-            else:
-                image_urls = current_urls
+                    # Nothing in the window, but stale rows may still be sitting
+                    # in Postgres — recall_visuals is the only thing that prunes,
+                    # and we just skipped it.
+                    await cache.prune_visuals(chat_id, min_turn)
 
-        # What we store/show as the user's text (visuals aren't persisted in history).
+        # What we store/show as the user's text (media isn't persisted in history).
         # In groups it's prefixed with the speaker's name for multi-person context.
         if cleaned_text:
             text_for_model = cleaned_text
@@ -1370,21 +1623,26 @@ async def handle_chat_message(message: Message, bot: Bot):
             text_for_model = "[sent an audio message]"
         elif message.video_note or message.video:
             text_for_model = "[sent a video]"
-        elif is_gif:
+        elif message.animation:
             text_for_model = "[sent a gif]"
+        elif len(batch) > 1:
+            text_for_model = f"[sent {len(batch)} photos]"
         elif has_media:
             text_for_model = "[sent media]"
         else:
             text_for_model = ""
 
-        notes = []
-        if has_media and not vision_on:
+        notes = list(extraction_notes)
+        if has_media and not can_take_media:
             notes.append(
-                "the user sent media (image/video/audio) but the current model can't process it — "
+                "the user sent media but the current model can't process it — "
                 "tell them to switch with /model to a multimodal model."
             )
-        if is_gif and image_urls:
-            notes.append("some attached images are still frames extracted from a video/gif.")
+        # Scoped to THIS turn's extraction. It used to be OR-ed with the retained
+        # rows' flag, so a plain photo got labelled "extracted from a video/gif"
+        # for as long as an old GIF stayed in the window.
+        if this_turn_is_gif:
+            notes.append("some attached images are still frames from a video/gif.")
         if had_prior_media:
             notes.append(
                 "some attached media is from the last few messages, kept so you can answer "
@@ -1416,17 +1674,14 @@ async def handle_chat_message(message: Message, bot: Bot):
         # ── Rapid-fire & Forwarded Debounce ───────────────────────────
         # Batch a burst from ONE person into a single reply: wait a moment, and
         # if that same person sent something newer meanwhile, let their newer
-        # handler answer for the whole burst.
+        # handler answer for the whole burst. The slot was claimed above; this is
+        # just the wait.
         #
         # Keyed per (chat, sender), not per chat. With a single per-chat slot,
         # anyone else typing cancelled the pending reply to the person the bot
         # was actually answering — in a busy group the bot could be starved
         # indefinitely and never reply to anyone.
-        debounce_key = (chat_id, message.from_user.id if message.from_user else 0)
-        msg_time = time.time()
-        _chat_last_msg_time[debounce_key] = msg_time
-        _prune_debounce_keys()
-
+        #
         # Another bot's messages get a longer pause so humans can keep up, but
         # 6s was long enough to read as the bot being broken.
         is_other_bot = getattr(message.from_user, "is_bot", False) if message.from_user else False
@@ -1471,8 +1726,8 @@ async def handle_chat_message(message: Message, bot: Bot):
                 chat_id=chat_id,
                 requester_is_privileged=privileged,
                 show_tool_notes=show_tool_notes,
-                image_urls=image_urls or None,
-                context_image_urls=context_image_urls or None,
+                media_items=media_items or None,
+                context_media_items=context_media_items or None,
                 is_group=is_group,
             )
 
@@ -1560,7 +1815,7 @@ async def handle_chat_message(message: Message, bot: Bot):
 
 
 @router.message(F.chat.type.in_({"group", "supergroup"}))
-async def handle_group_passive(message: Message, bot: Bot):
+async def handle_group_passive(message: Message, bot: Bot, album: list = None):
     """
     Passively records group messages the bot did NOT reply to (e.g. mention-only
     mode, non-mention chatter) into history, so when it IS mentioned it has the
@@ -1572,23 +1827,35 @@ async def handle_group_passive(message: Message, bot: Bot):
     if not await cache.get_chat_active(chat_id):
         return
 
+    batch = album or [message]
     text = (message.text or message.caption or "").strip()
-    has_media = _message_has_media(message)
+    has_media = any(_message_has_media(m) for m in batch)
     if not text and not has_media:
         return
 
-    # Capture images posted WITHOUT mentioning the bot, so when it's later
-    # @-mentioned it can still see them (the mention-only blind spot). Only when a
-    # vision model is active — otherwise there's nothing that could use them.
-    if has_media:
-        spec = models.resolve_spec(await cache.get_active_model())
-        if spec.supports_vision:
-            turn, _ = await cache.bump_chat_turn(chat_id)
-            urls, is_gif = await _extract_multimodal_data_urls(message, bot)
-            if urls:
-                await cache.remember_visuals(
-                    chat_id, turn, [{"data_url": u, "is_gif": is_gif} for u in urls]
-                )
+    # Capture media posted WITHOUT mentioning the bot, so when it's later
+    # @-mentioned it can still see it (the mention-only blind spot). Only when a
+    # model that can use it is active — otherwise there's nothing to gain.
+    spec = models.resolve_spec(await cache.get_active_model())
+    if spec.supports_vision or spec.supports_audio:
+        turn, _ = await cache.bump_chat_turn(chat_id)
+
+        if has_media:
+            try:
+                result = await extract_media(batch, bot)
+                if result.items:
+                    await cache.remember_visuals(chat_id, turn, [
+                        {"data_url": i.data_url, "kind": i.kind, "is_gif": i.is_gif}
+                        for i in result.items
+                    ])
+            except Exception as e:
+                logger.error(f"Passive media capture failed in chat {chat_id}: {e}")
+
+        # Prune here too. Pruning only ever happened inside recall_visuals, which
+        # this handler never calls — so in a mention-only group multi-megabyte
+        # base64 rows piled up in Postgres indefinitely.
+        if config.VISUAL_MEMORY_TURNS > 0:
+            await cache.prune_visuals(chat_id, turn - config.VISUAL_MEMORY_TURNS + 1)
 
     # Log the message (attributed) so the transcript reflects it — including a
     # placeholder for image-only posts.
