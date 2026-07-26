@@ -35,8 +35,22 @@ class ModelSpec:
         return bool(self.api_key)
 
     def call_kwargs(self) -> dict:
-        """Base kwargs for litellm.acompletion for this model."""
-        kw = {"model": self.litellm_model, "api_key": self.api_key}
+        """
+        Base kwargs for litellm.acompletion for this model.
+
+        `timeout` and `num_retries` are not optional extras: litellm's defaults
+        are a ~600s timeout and internal retries, so one stalled provider call
+        used to hold an LLM concurrency slot for ten minutes and freeze every
+        chat. Retries are handled by _call_llm_with_retry, which knows how to
+        tell a rate limit from a hard failure — litellm retrying underneath it
+        would just multiply the wall-clock cost of a bad call.
+        """
+        kw = {
+            "model": self.litellm_model,
+            "api_key": self.api_key,
+            "timeout": config.LLM_TIMEOUT_SECONDS,
+            "num_retries": 0,
+        }
         if self.api_base:
             kw["api_base"] = self.api_base
         return kw

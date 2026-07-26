@@ -158,6 +158,33 @@ def _path_args_are_safe(args_list: List[str], workspace: str) -> bool:
     return True
 
 
+def _call_with_optional_timeout(fn, timeout: float, *args, **kwargs):
+    """
+    Call `fn`, passing `timeout=` only if its signature accepts it.
+
+    The search backends are optional third-party packages whose keyword support
+    varies between versions, and blindly passing `timeout=` to one that doesn't
+    take it raises TypeError — turning a working search into a hard failure. If
+    the callable can't be told to time out, we log it, because the caller's
+    thread-pool bound stops us *waiting* on that thread but can't reclaim it.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+        accepts = "timeout" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (TypeError, ValueError):
+        accepts = False
+
+    if accepts:
+        return fn(*args, timeout=timeout, **kwargs)
+
+    logger.debug(f"{getattr(fn, '__name__', fn)} takes no timeout=; relying on the pool bound.")
+    return fn(*args, **kwargs)
+
+
 def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
     """
     Executes a web search. Uses Exa if EXA_API_KEY is present, else falls back to DuckDuckGo.
@@ -168,12 +195,20 @@ def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
 
     logger.info(f"Executing web search for: '{query}'")
     
+    # Both backends below are given an explicit timeout. Their library defaults
+    # are "wait forever", and these calls run in a bounded thread pool where a
+    # thread stuck in a socket read is unrecoverable — the caller's asyncio
+    # timeout stops the *waiting*, not the thread.
+    timeout = config.SEARCH_TIMEOUT_SECONDS
+
     exa_key = os.getenv("EXA_API_KEY")
     if exa_key:
         try:
             from exa_py import Exa
             exa = Exa(exa_key)
-            res = exa.search_and_contents(query, num_results=max_results)
+            res = _call_with_optional_timeout(
+                exa.search_and_contents, timeout, query, num_results=max_results
+            )
             if not res.results:
                 return [{"message": "No results found."}]
             return [
@@ -194,7 +229,7 @@ def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
         return [{"error": "DuckDuckGo search package is not installed/available."}]
 
     try:
-        with DDGS() as ddgs:
+        with _call_with_optional_timeout(DDGS, timeout) as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
             if not results:
                 return [{"message": "No results found."}]

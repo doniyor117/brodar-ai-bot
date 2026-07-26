@@ -28,18 +28,49 @@ pending_approvals = {}
 
 @router.callback_query(F.data.startswith("approve:") | F.data.startswith("deny:"))
 async def handle_approval(callback: CallbackQuery):
+    """
+    Resolves a privileged-tool approval prompt.
+
+    AccessControlMiddleware is registered on router.message only, so callback
+    queries reach this handler with no access check whatsoever. Until this gate
+    existed, any member of a group could tap ✅ on a ban or a persona rewrite.
+    """
     action, call_id = callback.data.split(":", 1)
-    if call_id in pending_approvals:
-        future = pending_approvals.pop(call_id)
-        if not future.done():
-            future.set_result(action == "approve")
-        
-        # Determine status visually
-        status_text = "✅ Approved" if action == "approve" else "❌ Denied"
-        
-        # We replace the inline keyboard with the status message, keeping the original text
-        msg_text = callback.message.text
-        await callback.message.edit_text(f"{msg_text}\n\n{status_text} by @{callback.from_user.username}")
+
+    if callback.message is None:
+        # Too old for Telegram to send back, so we can't tell which chat it was
+        # in and therefore can't authorize the tapper. Fail closed.
+        await callback.answer("this request is too old to confirm.", show_alert=True)
+        return
+
+    if not await is_user_privileged(callback.message, callback.bot, user=callback.from_user):
+        logger.warning(
+            f"Rejected approval tap from unauthorized user {callback.from_user.id} "
+            f"in chat {callback.message.chat.id if callback.message else '?'}"
+        )
+        await callback.answer("only an admin can approve this.", show_alert=True)
+        return
+
+    future = pending_approvals.pop(call_id, None)
+    if future is None:
+        await callback.answer("that request already expired.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    if not future.done():
+        future.set_result(action == "approve")
+
+    status_text = "✅ Approved" if action == "approve" else "❌ Denied"
+    who = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.full_name
+    try:
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n{status_text} by {who}", reply_markup=None
+        )
+    except Exception as e:
+        logger.warning(f"Failed to update approval prompt: {e}")
     await callback.answer(f"Tool {action}d")
 
 class ModelCallback(CallbackData, prefix="model"):
@@ -190,6 +221,53 @@ async def set_bot_commands(bot: Bot):
     await bot.set_my_commands(group_admin_commands, scope=BotCommandScopeAllChatAdministrators())
     logger.info("Bot commands configured successfully with separate visibilities.")
 
+# Word-boundary matcher for the bot's spoken-name aliases ("brodar", "simon bro",
+# "samy", …). Built once; \b keeps "brodark" or "samya" from counting as a call.
+_ALIAS_RE = _re.compile(
+    r"\b(?:" + "|".join(_re.escape(a) for a in config.BOT_ALIASES) + r")\b",
+    _re.IGNORECASE,
+) if config.BOT_ALIASES else None
+
+
+def message_addresses_bot(message: Message, bot_id: int, bot_username: str) -> bool:
+    """
+    True if this message is calling the bot.
+
+    Four independent ways to be addressed, all of which must work:
+      1. a reply to one of the bot's own messages
+      2. an @username mention — matched via Telegram's *entities* as well as the
+         raw text, because a mention typed with different casing, or inserted by
+         a client as a rich text_mention (which carries no "@" in the text at
+         all), never appears as a literal "@username" substring
+      3. a text_mention entity pointing at the bot's user id
+      4. any spoken alias from config.BOT_ALIASES
+
+    Only (4) and an exactly-cased (2) used to work, which is why @-mentioning the
+    bot in a mention-only group appeared to be ignored while typing "brodar" worked.
+    """
+    if message.reply_to_message and message.reply_to_message.from_user:
+        if message.reply_to_message.from_user.id == bot_id:
+            return True
+
+    text = message.text or message.caption or ""
+    entities = message.entities or message.caption_entities or []
+    for ent in entities:
+        if ent.type == "text_mention" and ent.user and ent.user.id == bot_id:
+            return True
+        if ent.type == "mention" and bot_username:
+            mentioned = text[ent.offset:ent.offset + ent.length]
+            if mentioned.lstrip("@").lower() == bot_username.lower():
+                return True
+
+    if not text:
+        return False
+
+    if bot_username and f"@{bot_username.lower()}" in text.lower():
+        return True
+
+    return bool(_ALIAS_RE and _ALIAS_RE.search(text))
+
+
 class ShouldRespondFilter(BaseFilter):
     """
     Determines if the bot should process and respond to a message:
@@ -205,7 +283,7 @@ class ShouldRespondFilter(BaseFilter):
             return bool(user_id and await cache.is_user_allowed(user_id))
 
         chat_id = message.chat.id
-        
+
         # Check if group is active first
         is_active = await cache.get_chat_active(chat_id)
         if not is_active:
@@ -222,21 +300,7 @@ class ShouldRespondFilter(BaseFilter):
         if not BOT_USERNAME:
             await init_bot_info(bot)
 
-        text = message.text or message.caption or ""
-        
-        # Check if username or name is mentioned in text
-        text_lower = text.lower()
-        if BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text_lower:
-            return True
-        if "brodar" in text_lower:
-            return True
-
-        # Check if the message is a reply to the bot itself
-        if message.reply_to_message and message.reply_to_message.from_user:
-            if message.reply_to_message.from_user.id == bot.id:
-                return True
-
-        return False
+        return message_addresses_bot(message, bot.id, BOT_USERNAME)
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096
 
@@ -252,37 +316,38 @@ SILENT_TOKEN = "[SILENT]"
 BOT_LOOP_THRESHOLD = 10  # consecutive bot-looking user messages before auto-silence
 
 def _looks_like_bot_loop(history: list, threshold: int = BOT_LOOP_THRESHOLD) -> bool:
-    """Detect if recent history looks like a bot-to-bot infinite conversation."""
-    if len(history) < threshold * 2:
+    """
+    Detect a bot-to-bot ping-pong: `threshold` incoming messages in a row, all
+    from other bots and none from a human.
+
+    Deliberately keyed on the `[BOT] ` tag alone. The tag comes from Telegram's
+    own is_bot flag via _speaker_name(), so it is exact. The prose heuristics
+    this replaces were catastrophically wrong: one of their four markers was
+    `text[0].isupper()`, but _attribute() prefixes every group message with a
+    capitalized display name, so that marker was true for 100% of messages —
+    any message over 200 chars or containing "here's" then hit the 2-marker
+    threshold. Enough normal human chatter tripped it that groups went silent
+    and stayed silent for the whole 250-message history window.
+
+    Requiring *consecutive* bot messages also means one human reply immediately
+    clears the condition, so the worst case is now a brief pause, not a mute.
+    """
+    if len(history) < threshold:
         return False
 
-    recent = history[-(threshold * 2):]  # last N pairs
-
-    bot_indicators = 0
-    for msg in recent:
-        if msg["role"] == "user":
-            text = msg.get("content", "")
-            
-            # Direct bot tag check
-            if text.startswith("[BOT] "):
-                bot_indicators += 1
-                continue
-                
-            # Heuristics for AI-generated text in a casual chat context:
-            ai_markers = [
-                bool(text) and text[0].isupper(),
-                any(p in text.lower() for p in [
-                    "certainly", "i'd be happy to", "as an ai",
-                    "here's", "here is", "let me help",
-                    "is there anything else", "i can help",
-                ]),
-                len(text) > 200,
-                bool(_re.search(r"^\s*[\-\*\d]+[\.\)]\s", text, _re.MULTILINE)),
-            ]
-            if sum(ai_markers) >= 2:
-                bot_indicators += 1
-
-    return bot_indicators >= threshold - 1
+    streak = 0
+    for msg in reversed(history):
+        if msg.get("role") != "user":
+            # One of our own replies sits between two incoming messages; it
+            # doesn't break a bot streak, but it doesn't extend it either.
+            continue
+        if (msg.get("content") or "").startswith("[BOT] "):
+            streak += 1
+            if streak >= threshold:
+                return True
+        else:
+            return False
+    return False
 
 # Spans we must NOT lowercase: fenced code, inline code, and URLs. Everything
 # else in a conversational reply gets forced to lowercase to keep brodar in
@@ -360,18 +425,23 @@ async def send_long_reply(message: Message, text: str) -> None:
             await message.answer(chunk)
 
 
-async def is_user_privileged(message: Message, bot: Bot) -> bool:
+async def is_user_privileged(message: Message, bot: Bot, user=None) -> bool:
     """
     True if the sender may run state-changing commands / tools:
     DM-allowlisted users anywhere, or group administrators in their group.
+
+    `user` overrides message.from_user. Callback queries need it: the message
+    carrying the inline keyboard was sent by the bot, so its from_user is the
+    bot, not the person who tapped the button.
     """
-    user_id = message.from_user.id if message.from_user else None
+    actor = user or message.from_user
+    user_id = actor.id if actor else None
     if not user_id:
         return False
     if await cache.is_user_allowed(user_id):
         return True
     if message.chat.type != "private":
-        return await is_sender_admin(message, bot)
+        return await is_sender_admin(message, bot, user_id=user_id)
     return False
 
 
@@ -1086,7 +1156,17 @@ async def _extract_multimodal_data_urls(message: Message, bot: Bot) -> tuple:
     return urls, is_gif
 
 
+# Debounce bookkeeping, keyed (chat_id, user_id) -> last message timestamp.
 _chat_last_msg_time: dict = {}
+_DEBOUNCE_KEY_LIMIT = 2000
+
+
+def _prune_debounce_keys() -> None:
+    """Drop the oldest debounce entries so the dict can't grow without bound."""
+    if len(_chat_last_msg_time) <= _DEBOUNCE_KEY_LIMIT:
+        return
+    for key, _ in sorted(_chat_last_msg_time.items(), key=lambda kv: kv[1])[:len(_chat_last_msg_time) // 2]:
+        _chat_last_msg_time.pop(key, None)
 
 
 @router.message(ShouldRespondFilter())
@@ -1103,9 +1183,17 @@ async def handle_chat_message(message: Message, bot: Bot):
     if not BOT_USERNAME:
         await init_bot_info(bot)
 
+    # Swap the raw @handle for the bot's spoken name rather than deleting it.
+    # Deleting it erased the only evidence that the message was addressed to the
+    # bot at all, so in a group the model saw a bare "what do you think?" and
+    # applied its stay-out-of-other-people's-conversations rule — the bot got
+    # @-mentioned and answered with silence.
     cleaned_text = raw_text
     if BOT_USERNAME:
-        cleaned_text = raw_text.replace(f"@{BOT_USERNAME}", "").strip()
+        spoken_name = config.BOT_ALIASES[0] if config.BOT_ALIASES else "brodar"
+        cleaned_text = _re.sub(
+            _re.escape(f"@{BOT_USERNAME}"), spoken_name, raw_text, flags=_re.IGNORECASE
+        ).strip()
 
     has_media = _message_has_media(message)
 
@@ -1113,138 +1201,8 @@ async def handle_chat_message(message: Message, bot: Bot):
     if not cleaned_text and not has_media:
         return
 
-    # Whether this sender may drive state-changing tools (persona/skill edits,
-    # group moderation). Checked once here and passed into the agent.
-    privileged = await is_user_privileged(message, bot)
-    show_tool_notes = await cache.get_chat_tool_notes(chat_id)
-
-    # Vision handling. Only bother if the active model can actually see images.
-    image_urls = []            # current turn's images (attached to this message)
-    context_image_urls = []    # prior turns' images (chronological context block)
-    is_gif = False
-    had_prior_media = False
-    vision_on = False
-    if has_media or config.VISUAL_MEMORY_TURNS > 0:
-        vision_on = models.resolve_spec(await cache.get_active_model()).supports_vision
-
-    if vision_on:
-        # Advance the per-chat turn counter (drives visual aging). Returns the last
-        # turn that carried a visual, so we know whether to look for retained images.
-        turn, last_visual_turn = await cache.bump_chat_turn(chat_id)
-
-        current_urls = []
-        if has_media:
-            current_urls, is_gif = await _extract_multimodal_data_urls(message, bot)
-            if current_urls:
-                await cache.remember_visuals(
-                    chat_id, turn,
-                    [{"data_url": u, "is_gif": is_gif} for u in current_urls],
-                )
-                last_visual_turn = turn
-
-        if config.VISUAL_MEMORY_TURNS > 0:
-            min_turn = turn - config.VISUAL_MEMORY_TURNS + 1
-            # Only touch the visuals table if something is actually in the window.
-            if last_visual_turn >= min_turn:
-                retained = await cache.recall_visuals(chat_id, min_turn, config.VISUAL_MEMORY_MAX_IMAGES)
-                # Keep chronological order; split "this turn" from earlier turns.
-                image_urls = [r["data_url"] for r in retained if r["turn"] >= turn]
-                context_image_urls = [r["data_url"] for r in retained if r["turn"] < turn]
-                is_gif = is_gif or any(r.get("is_gif") for r in retained)
-                had_prior_media = bool(context_image_urls)
-            else:
-                image_urls = current_urls
-        else:
-            image_urls = current_urls
-
-    # What we store/show as the user's text (visuals aren't persisted in history).
-    # In groups it's prefixed with the speaker's name for multi-person context.
-    if cleaned_text:
-        text_for_model = cleaned_text
-    elif message.sticker:
-        text_for_model = "[sent a sticker]"
-    elif message.voice or message.audio:
-        text_for_model = "[sent an audio message]"
-    elif message.video_note or message.video:
-        text_for_model = "[sent a video]"
-    elif is_gif:
-        text_for_model = "[sent a gif]"
-    elif has_media:
-        text_for_model = "[sent media]"
-    else:
-        text_for_model = ""
-
-    notes = []
-    if has_media and not vision_on:
-        notes.append(
-            "the user sent media (image/video/audio) but the current model can't process it — "
-            "tell them to switch with /model to a multimodal model."
-        )
-    if is_gif and image_urls:
-        notes.append("some attached images are still frames extracted from a video/gif.")
-    if had_prior_media:
-        notes.append(
-            "some attached media is from the last few messages, kept so you can answer "
-            "follow-ups about them; the newest belong to the current message."
-        )
-    if notes:
-        text_for_model += "\n\n(note: " + " ".join(notes) + ")"
-        
-    if message.forward_origin:
-        text_for_model = f"[Forwarded message]\n{text_for_model}"
-        
-    if message.reply_to_message:
-        r_msg = message.reply_to_message
-        r_speaker = _speaker_name(r_msg)
-        r_text = r_msg.text or r_msg.caption or "[media]"
-        r_text = r_text[:200] + ("..." if len(r_text) > 200 else "")
-        text_for_model = f"[Replying to {r_speaker}: '{r_text}']\n{text_for_model}"
-        
-    attributed_text = _attribute(message, text_for_model)
-
-    # Prime the cache from DB BEFORE appending the new message.
-    # Without this, a cold-start save creates an empty deque that
-    # shadows the database, erasing all prior context.
-    await cache.get_chat_history(chat_id)
-
-    # Save user message to history IMMEDIATELY so follow-up messages see it in context.
-    cache.save_messages_async(chat_id, [{"role": "user", "content": attributed_text}])
-
-    # ── Rapid-fire & Forwarded Debounce ───────────────────────────
-    # If the user sends a forwarded message, wait 8 seconds for them to type a follow-up.
-    # For normal messages, wait 1.5 seconds to batch rapid-fire texts (e.g. hitting Enter multiple times).
-    import time
-    _chat_last_msg_time[chat_id] = time.time()
-    msg_time = _chat_last_msg_time[chat_id]
-    
-    # If the sender is another bot, slow things down massively so humans can read
-    is_other_bot = getattr(message.from_user, "is_bot", False) if message.from_user else False
-    if message.forward_origin:
-        delay = 8.0
-    elif is_other_bot:
-        delay = 6.0
-    else:
-        delay = 1.5
-        
-    await asyncio.sleep(delay)
-    
-    # If a newer message arrived while we slept, its handler updated the timestamp.
-    # We abort this generation and let the newest handler process the combined history!
-    if _chat_last_msg_time.get(chat_id) != msg_time:
-        logger.info(f"Skipping generation in chat {chat_id} because a newer message arrived.")
-        return
-
-    # Now fetch the history (which includes our immediately-saved message, plus any others).
-    history = await cache.get_chat_history(chat_id)
-
-    is_group = message.chat.type in ("group", "supergroup")
-
-    # Server-side bot-loop safety net. If recent history looks like a
-    # bot-to-bot infinite conversation, skip the LLM call entirely.
-    if is_group and _looks_like_bot_loop(history):
-        logger.info(f"Bot-loop detected in chat {chat_id}, auto-silencing.")
-        return
-
+    # Register for /stop cancellation before any awaiting work, so a stuck
+    # download or debounce sleep can still be killed.
     current_task = asyncio.current_task()
     if current_task:
         agent.register_running_task(chat_id, current_task)
@@ -1252,7 +1210,158 @@ async def handle_chat_message(message: Message, bot: Bot):
     import time
     start_time = time.time()
 
+    # Everything from here down is inside the try. Media download, ffmpeg
+    # extraction and the history write used to sit ABOVE it, so any failure
+    # there propagated to main.py's catch-all, which logs and swallows it:
+    # no reply, no error message, the bot simply appeared dead.
     try:
+        # Whether this sender may drive state-changing tools (persona/skill edits,
+        # group moderation). Checked once here and passed into the agent.
+        privileged = await is_user_privileged(message, bot)
+        show_tool_notes = await cache.get_chat_tool_notes(chat_id)
+
+        # Vision handling. Only bother if the active model can actually see images.
+        image_urls = []            # current turn's images (attached to this message)
+        context_image_urls = []    # prior turns' images (chronological context block)
+        is_gif = False
+        had_prior_media = False
+        vision_on = False
+        if has_media or config.VISUAL_MEMORY_TURNS > 0:
+            vision_on = models.resolve_spec(await cache.get_active_model()).supports_vision
+
+        if vision_on:
+            # Advance the per-chat turn counter (drives visual aging). Returns the last
+            # turn that carried a visual, so we know whether to look for retained images.
+            turn, last_visual_turn = await cache.bump_chat_turn(chat_id)
+
+            current_urls = []
+            if has_media:
+                current_urls, is_gif = await _extract_multimodal_data_urls(message, bot)
+                if current_urls:
+                    await cache.remember_visuals(
+                        chat_id, turn,
+                        [{"data_url": u, "is_gif": is_gif} for u in current_urls],
+                    )
+                    last_visual_turn = turn
+
+            if config.VISUAL_MEMORY_TURNS > 0:
+                min_turn = turn - config.VISUAL_MEMORY_TURNS + 1
+                # Only touch the visuals table if something is actually in the window.
+                if last_visual_turn >= min_turn:
+                    retained = await cache.recall_visuals(chat_id, min_turn, config.VISUAL_MEMORY_MAX_IMAGES)
+                    # Keep chronological order; split "this turn" from earlier turns.
+                    image_urls = [r["data_url"] for r in retained if r["turn"] >= turn]
+                    context_image_urls = [r["data_url"] for r in retained if r["turn"] < turn]
+                    is_gif = is_gif or any(r.get("is_gif") for r in retained)
+                    had_prior_media = bool(context_image_urls)
+                else:
+                    image_urls = current_urls
+            else:
+                image_urls = current_urls
+
+        # What we store/show as the user's text (visuals aren't persisted in history).
+        # In groups it's prefixed with the speaker's name for multi-person context.
+        if cleaned_text:
+            text_for_model = cleaned_text
+        elif message.sticker:
+            text_for_model = "[sent a sticker]"
+        elif message.voice or message.audio:
+            text_for_model = "[sent an audio message]"
+        elif message.video_note or message.video:
+            text_for_model = "[sent a video]"
+        elif is_gif:
+            text_for_model = "[sent a gif]"
+        elif has_media:
+            text_for_model = "[sent media]"
+        else:
+            text_for_model = ""
+
+        notes = []
+        if has_media and not vision_on:
+            notes.append(
+                "the user sent media (image/video/audio) but the current model can't process it — "
+                "tell them to switch with /model to a multimodal model."
+            )
+        if is_gif and image_urls:
+            notes.append("some attached images are still frames extracted from a video/gif.")
+        if had_prior_media:
+            notes.append(
+                "some attached media is from the last few messages, kept so you can answer "
+                "follow-ups about them; the newest belong to the current message."
+            )
+        if notes:
+            text_for_model += "\n\n(note: " + " ".join(notes) + ")"
+
+        if message.forward_origin:
+            text_for_model = f"[Forwarded message]\n{text_for_model}"
+
+        if message.reply_to_message:
+            r_msg = message.reply_to_message
+            r_speaker = _speaker_name(r_msg)
+            r_text = r_msg.text or r_msg.caption or "[media]"
+            r_text = r_text[:200] + ("..." if len(r_text) > 200 else "")
+            text_for_model = f"[Replying to {r_speaker}: '{r_text}']\n{text_for_model}"
+
+        attributed_text = _attribute(message, text_for_model)
+
+        # Prime the cache from DB BEFORE appending the new message.
+        # Without this, a cold-start save creates an empty deque that
+        # shadows the database, erasing all prior context.
+        await cache.get_chat_history(chat_id)
+
+        # Save user message to history IMMEDIATELY so follow-up messages see it in context.
+        cache.save_messages_async(chat_id, [{"role": "user", "content": attributed_text}])
+
+        # ── Rapid-fire & Forwarded Debounce ───────────────────────────
+        # Batch a burst from ONE person into a single reply: wait a moment, and
+        # if that same person sent something newer meanwhile, let their newer
+        # handler answer for the whole burst.
+        #
+        # Keyed per (chat, sender), not per chat. With a single per-chat slot,
+        # anyone else typing cancelled the pending reply to the person the bot
+        # was actually answering — in a busy group the bot could be starved
+        # indefinitely and never reply to anyone.
+        debounce_key = (chat_id, message.from_user.id if message.from_user else 0)
+        msg_time = time.time()
+        _chat_last_msg_time[debounce_key] = msg_time
+        _prune_debounce_keys()
+
+        # Another bot's messages get a longer pause so humans can keep up, but
+        # 6s was long enough to read as the bot being broken.
+        is_other_bot = getattr(message.from_user, "is_bot", False) if message.from_user else False
+        if message.forward_origin:
+            delay = 3.0
+        elif is_other_bot:
+            delay = 2.5
+        else:
+            delay = 1.5
+
+        await asyncio.sleep(delay)
+
+        # If a newer message from the same sender arrived while we slept, its
+        # handler updated the timestamp. Abort and let it answer the combined
+        # history.
+        if _chat_last_msg_time.get(debounce_key) != msg_time:
+            logger.info(f"Skipping generation in chat {chat_id} because a newer message arrived.")
+            return
+
+        # Now fetch the history (which includes our immediately-saved message, plus any others).
+        history = await cache.get_chat_history(chat_id)
+
+        is_group = message.chat.type in ("group", "supergroup")
+
+        # Server-side bot-loop safety net. If recent history looks like a
+        # bot-to-bot infinite conversation, skip the LLM call entirely.
+        if is_group and _looks_like_bot_loop(history):
+            # Warning, not info: if this ever fires wrongly the bot goes quiet,
+            # and the last version of this check fired wrongly all the time. It
+            # needs to be visible in the Render logs.
+            logger.warning(
+                f"Bot-loop detected in chat {chat_id} "
+                f"({BOT_LOOP_THRESHOLD} consecutive [BOT] messages); staying silent."
+            )
+            return
+
         async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
             logger.info(f"Generating agent response for chat {chat_id}...")
             bot_reply = await agent.generate_response(
@@ -1335,6 +1444,14 @@ async def handle_chat_message(message: Message, bot: Bot):
     except asyncio.CancelledError:
         logger.info(f"Task execution for chat {chat_id} was cancelled by emergency stop.")
         raise
+    except TimeoutError as e:
+        # A bounded failure, not a crash — say which so it doesn't read as the
+        # generic "everything is broken" message.
+        logger.error(f"Timed out handling message in chat {chat_id}: {e}")
+        try:
+            await message.reply("the model's taking way too long. try again in a sec.")
+        except Exception as send_err:
+            logger.error(f"Failed to send timeout message: {send_err}")
     except Exception as e:
         logger.error(f"Error handling user message in chat {chat_id}: {e}", exc_info=True)
         try:

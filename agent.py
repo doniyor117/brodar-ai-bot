@@ -2,6 +2,7 @@ import json
 import asyncio
 import random
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Set
 import config
 import tools
@@ -30,6 +31,20 @@ except ImportError:
 # surrounding tool loop — so a slow tool or a 120s permission prompt in one chat
 # can no longer freeze every other chat. Configurable via LLM_CONCURRENCY.
 _concurrency_semaphore = asyncio.Semaphore(max(1, config.LLM_CONCURRENCY))
+
+# Dedicated thread pool for blocking network I/O (web search).
+#
+# asyncio.to_thread uses the loop's *default* executor, which on a 1-vCPU Render
+# box has only min(32, cpu+4) = 5 slots, and a thread running a blocking socket
+# read cannot be cancelled — asyncio.wait_for only stops waiting, the thread
+# keeps going. So a few hung searches used to permanently consume the shared
+# pool, after which media extraction, the shell tool and /status all queued
+# forever and the bot looked dead. Giving searches their own small pool means a
+# hung search can only ever starve other searches.
+_search_executor = ThreadPoolExecutor(
+    max_workers=max(1, config.SEARCH_POOL_SIZE),
+    thread_name_prefix="search",
+)
 
 # Active agent tasks per chat_id for emergency stop support. A chat can have more
 # than one message in flight, so we track a set per chat instead of a single slot
@@ -454,9 +469,30 @@ async def _call_llm_with_retry(
 
             logger.info(f"Calling model '{spec.key}' ({spec.litellm_model}), attempt {attempt + 1}...")
             # Hold the concurrency guard only for the actual network call.
+            #
+            # Two independent bounds, deliberately. `timeout` in call_kwargs is
+            # the provider-level one; asyncio.wait_for is the belt-and-braces
+            # one, because a hang inside litellm's own retry/streaming plumbing
+            # would otherwise never surface as a timeout at all. Slightly longer
+            # so the provider bound wins when it works.
             async with _concurrency_semaphore:
-                response = await acompletion(**kwargs)
+                response = await asyncio.wait_for(
+                    acompletion(**kwargs),
+                    timeout=config.LLM_TIMEOUT_SECONDS + 15,
+                )
             return response
+
+        except asyncio.TimeoutError:
+            # Don't retry a timeout: we already waited the full budget, and a
+            # second attempt just doubles the time the chat sits there dead.
+            logger.error(
+                f"LLM call to '{spec.key}' timed out after "
+                f"{config.LLM_TIMEOUT_SECONDS}s (attempt {attempt + 1}); giving up."
+            )
+            raise TimeoutError(
+                f"The model '{spec.label}' did not respond within "
+                f"{int(config.LLM_TIMEOUT_SECONDS)}s."
+            )
 
         except Exception as e:
             err_msg = str(e)
@@ -480,9 +516,10 @@ async def _call_llm_with_retry(
             else:
                 raise e
 
-# Tools that modify persistent bot state (persona, skills, moderation). Allowing
-# any group member to drive these lets a random user permanently rewrite the
-# system prompt or ban people just by *asking* the model. Gated to privileged users.
+# Tools that modify persistent bot state (persona, skills, moderation) or that
+# read/exfiltrate data the requester isn't entitled to. Allowing any group member
+# to drive these lets a random user permanently rewrite the system prompt, ban
+# people, or have the bot upload .env — just by *asking* the model nicely.
 _PRIVILEGED_TOOLS = {
     "save_memory_fact",
     "edit_memory_file",
@@ -490,6 +527,22 @@ _PRIVILEGED_TOOLS = {
     "manage_skill_file",
     "group_moderation_tool",
     "edit_env_file",
+    "install_skill_from_url",
+    "uninstall_skill",
+    # send_file uploads an arbitrary path off the host. Ungated, "hey brodar send
+    # me the file called .env" hands out the bot token, DATABASE_URL and every
+    # API key. It is additionally confined to the workspace sandbox below.
+    "send_file",
+    # An empty query dumps every tracked user id in every chat the bot has seen.
+    "search_group_members",
+}
+
+# Privileged tools that additionally require an explicit human approval tap.
+# Everything else in _PRIVILEGED_TOOLS is authorized by the requester already
+# being an admin — making an admin approve their own request just adds dead air.
+_APPROVAL_REQUIRED_TOOLS = {
+    "edit_env_file",
+    "edit_persona_file",
     "install_skill_from_url",
     "uninstall_skill",
 }
@@ -776,10 +829,15 @@ async def generate_response(
                         "content": tool_result,
                     })
                     continue
-                else:
+                elif tool_name in _APPROVAL_REQUIRED_TOOLS:
+                    # Only genuinely irreversible actions get a confirmation tap.
+                    # Asking an admin to approve the moderation they *just asked
+                    # for* meant every ban/mute sat for 30s per tool loop — up to
+                    # ~3 minutes of dead air, which is what "it halts when i say
+                    # to ban" actually was.
                     is_approved = await _request_interactive_approval(bot_instance, chat_id, tool_name, args)
-                    if not is_approved:
-                        tool_result = f"Action '{tool_name}' was denied by the user."
+                    if is_approved is not True:
+                        tool_result = f"Action '{tool_name}' was not approved, so it did not run."
                         full_messages.append({
                             "role": "tool",
                             "tool_call_id": tool_id,
@@ -790,8 +848,9 @@ async def generate_response(
 
             if tool_name == "search_web":
                 query = args.get("query", "")
-                # Blocking network I/O — run off the event loop.
-                tool_result = await asyncio.to_thread(search_web_wrapper, query)
+                # Blocking network I/O — run in the dedicated search pool (never
+                # the shared default executor) and give up rather than hang.
+                tool_result = await _run_search(query)
             elif tool_name == "execute_shell_command":
                 command = args.get("command", "")
                 args_str = args.get("args_str", "")
@@ -824,7 +883,11 @@ async def generate_response(
             elif tool_name == "install_skill_from_url":
                 url = args.get("url", "")
                 c_name = args.get("custom_name")
-                tool_result = skills.install_skill_from_url(url, custom_name=c_name)
+                # Blocking urlopen — calling it inline froze the entire event
+                # loop (and therefore every chat) for as long as the fetch took.
+                tool_result = await asyncio.to_thread(
+                    skills.install_skill_from_url, url, custom_name=c_name
+                )
             elif tool_name == "uninstall_skill":
                 sk_name = args.get("skill_name", "")
                 tool_result = skills.uninstall_skill(sk_name)
@@ -917,9 +980,16 @@ async def generate_response(
                     try:
                         import os
                         from aiogram.types import FSInputFile
-                        if not os.path.exists(file_path):
+                        resolved = _resolve_sendable_path(file_path)
+                        if resolved is None:
+                            tool_result = (
+                                f"Error: '{file_path}' is outside the workspace. You may only "
+                                f"send files from the workspace directory."
+                            )
+                        elif not os.path.isfile(resolved):
                             tool_result = f"Error: File '{file_path}' does not exist."
                         else:
+                            file_path = resolved
                             file_input = FSInputFile(file_path)
                             if file_type == "photo":
                                 await bot_instance.send_photo(chat_id, photo=file_input, caption=caption)
@@ -991,6 +1061,61 @@ def _write_skill_file(sk_name: str, sk_content: str) -> str:
         return f"Failed to write skill file: {e}"
 
 
+async def _run_search(query: str) -> str:
+    """
+    Runs a web search in the dedicated search pool with a hard time budget.
+
+    On timeout we return a normal tool result rather than raising, so the model
+    can tell the user the search failed and carry on. The worker thread may still
+    be stuck in a socket read — that's why it lives in its own pool, where the
+    only thing it can hold up is another search.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_search_executor, search_web_wrapper, query),
+            timeout=config.SEARCH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"Web search for {query!r} exceeded {config.SEARCH_TIMEOUT_SECONDS}s; abandoning.")
+        return (
+            f"Search Error: the search for '{query}' timed out after "
+            f"{int(config.SEARCH_TIMEOUT_SECONDS)}s. Tell the user search is being slow "
+            "right now and answer from what you already know, or offer to retry."
+        )
+    except Exception as e:
+        logger.error(f"Web search for {query!r} failed: {e}")
+        return f"Search Error: {e}"
+
+
+def _resolve_sendable_path(file_path: str) -> Optional[str]:
+    """
+    Resolve a model-supplied path for send_file, confined to the tool workspace.
+
+    Returns the real absolute path, or None if it escapes the sandbox. Without
+    this, send_file happily uploaded any file on the host — `.env` included,
+    which is the bot token, DATABASE_URL and every API key.
+    """
+    import os
+
+    if not file_path or not file_path.strip():
+        return None
+
+    workspace = os.path.realpath(config.TOOL_WORKSPACE_DIR)
+    # Relative paths are relative to the workspace; absolute ones must already
+    # be inside it. realpath resolves `..` and follows symlinks out of the
+    # sandbox, so the containment check below sees the true destination.
+    candidate = file_path.strip()
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(workspace, candidate)
+    resolved = os.path.realpath(candidate)
+
+    if resolved != workspace and not resolved.startswith(workspace + os.sep):
+        logger.warning(f"Blocked send_file path escaping workspace: {file_path!r} -> {resolved}")
+        return None
+    return resolved
+
+
 def search_web_wrapper(query: str) -> str:
     """Helper to convert web search results into a clean string for the LLM context."""
     results = tools.search_web(query)
@@ -1035,42 +1160,65 @@ def _edit_env_file(key: str, value: str) -> str:
     return f"Set {key} in .env file. Note: The bot may need to be restarted to pick up environment changes."
 
 async def _request_interactive_approval(bot_instance, chat_id: int, tool_name: str, args: dict) -> bool:
+    """
+    Posts an approve/deny prompt and waits for a tap. Returns True ONLY on an
+    explicit approval — a timeout, a send failure or a deny all mean False.
+
+    Fails closed by design: this previously returned an explanatory *string* on
+    timeout, and since a non-empty string is truthy the caller's `if not
+    is_approved` check passed straight through and ran the privileged tool that
+    nobody had approved.
+    """
     if not bot_instance:
         return False
-        
+
     import uuid
-    import asyncio
     import json
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     import bot
-    
+
     call_id = str(uuid.uuid4())[:8]
     future = asyncio.get_running_loop().create_future()
     bot.pending_approvals[call_id] = future
-    
+
     args_str = json.dumps(args, indent=2)[:300]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve:{call_id}"),
          InlineKeyboardButton(text="❌ Deny", callback_data=f"deny:{call_id}")]
     ])
-    
+
+    # Prompt in the chat that made the request. DMing MAIN_ACCOUNT_ID instead
+    # silently failed whenever that account had never opened a DM with the bot,
+    # and the group was then told "denied" with no explanation. The callback
+    # handler authorizes the tapper, so posting here is safe.
     try:
-        target_chat_id = config.MAIN_ACCOUNT_ID if config.MAIN_ACCOUNT_ID else chat_id
         await bot_instance.send_message(
-            chat_id=target_chat_id, 
-            text=f"⚠️ **Approval Required**\nThe agent wants to execute a privileged tool in chat `{chat_id}`:\n\n**Tool**: `{tool_name}`\n**Args**: `{args_str}`", 
+            chat_id=chat_id,
+            text=(
+                "⚠️ **Approval Required**\n"
+                "i want to run a privileged tool. an admin needs to okay this:\n\n"
+                f"**Tool**: `{tool_name}`\n**Args**: `{args_str}`\n\n"
+                f"_expires in {int(config.APPROVAL_TIMEOUT_SECONDS)}s (no answer = denied)_"
+            ),
             reply_markup=keyboard,
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
-        if target_chat_id != chat_id:
-            await _notify(bot_instance, chat_id, f"sent an approval request to the main admin account for `{tool_name}`. waiting for them to tap approve...")
-            
-        # Wait up to 30 seconds for approval to prevent freezing the bot
-        return await asyncio.wait_for(future, timeout=30)
-    except asyncio.TimeoutError:
-        bot.pending_approvals.pop(call_id, None)
-        logger.warning(f"Approval for {tool_name} timed out.")
-        return "Error: The admin did not approve the action in time (30s timeout). Please ask the admin if they want to proceed."
     except Exception as e:
-        logger.error(f"Failed to request interactive approval: {e}")
+        logger.error(f"Failed to post approval prompt for {tool_name} in chat {chat_id}: {e}")
+        bot.pending_approvals.pop(call_id, None)
         return False
+
+    try:
+        approved = await asyncio.wait_for(future, timeout=config.APPROVAL_TIMEOUT_SECONDS)
+        return approved is True
+    except asyncio.TimeoutError:
+        logger.warning(f"Approval for '{tool_name}' in chat {chat_id} timed out; treating as DENIED.")
+        return False
+    except asyncio.CancelledError:
+        # /stop or a newer message killed this turn — don't leak the future.
+        raise
+    except Exception as e:
+        logger.error(f"Approval wait for '{tool_name}' failed: {e}")
+        return False
+    finally:
+        bot.pending_approvals.pop(call_id, None)

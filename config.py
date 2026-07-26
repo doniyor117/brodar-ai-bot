@@ -41,6 +41,33 @@ IMAGE_MODEL_NAME = os.getenv("IMAGE_MODEL_NAME", "dall-e-3")
 # concurrency limited, but 1 means a single slow chat blocks every other chat.
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2"))
 
+# ── Timeouts ────────────────────────────────────────────────────────────────
+# Every blocking dependency needs a bound. Without one, a single stalled call
+# holds a concurrency slot / thread / connection forever and the whole bot stops
+# responding — which is exactly what was happening in production.
+#
+# Wall-clock cap on one LLM call. litellm's own default is ~600s, which with
+# LLM_CONCURRENCY=2 means two stalled calls freeze every chat for ten minutes.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+# Cap on a web search (Exa or DuckDuckGo). These run in a dedicated thread pool.
+SEARCH_TIMEOUT_SECONDS = float(os.getenv("SEARCH_TIMEOUT_SECONDS", "25"))
+# How many searches may run at once. Deliberately its own small pool so a hung
+# search can never starve media extraction or the shell tool.
+SEARCH_POOL_SIZE = int(os.getenv("SEARCH_POOL_SIZE", "2"))
+# Cap on waiting for a free Postgres connection (separate from command_timeout,
+# which only bounds the query once a connection is already held). Matches the
+# pool's connect timeout, because acquiring may have to open a new connection
+# and Neon scales to zero — a shorter bound would fail every cold start.
+DB_ACQUIRE_TIMEOUT = float(os.getenv("DB_ACQUIRE_TIMEOUT", "30"))
+# How long an approval prompt stays live before it is treated as a DENIAL.
+APPROVAL_TIMEOUT_SECONDS = float(os.getenv("APPROVAL_TIMEOUT_SECONDS", "60"))
+
+# ── Addressing the bot ──────────────────────────────────────────────────────
+# Names that count as calling the bot in a mention-only group, in addition to
+# @username mentions, text_mention entities, and replies to the bot's messages.
+_aliases_raw = os.getenv("BOT_ALIASES", "brodar,simon bro,samy")
+BOT_ALIASES = [a.strip().lower() for a in _aliases_raw.split(",") if a.strip()]
+
 # Hard-enforce brodar's all-lowercase style in code, so a flash model slipping
 # and capitalizing can't break character. URLs and code spans are preserved.
 FORCE_LOWERCASE = os.getenv("FORCE_LOWERCASE", "true").strip().lower() in ("1", "true", "yes", "on")
