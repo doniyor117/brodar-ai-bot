@@ -833,6 +833,7 @@ def build_system_prompt(
     is_group: bool = False,
     requester_is_privileged: bool = False,
     loaded_skills: Optional[List[str]] = None,
+    mode: str = "conversation",
 ) -> str:
     """
     Compose the system prompt from ordered, non-contradictory blocks.
@@ -923,6 +924,33 @@ def build_system_prompt(
     if summary_text.strip():
         blocks.append(f"# Past Conversation Summary\n{summary_text.strip()}")
 
+    if mode == "extraction":
+        # Deliberately last: a scoped override for THIS reply only, not a
+        # rewrite of who brodar is. Without this, "transcribe this" gets a
+        # two-line lowercase joke, because PERSONA.md's "lowercase always /
+        # one or two lines / crack jokes" rules apply to every reply.
+        blocks.append(
+            "# Task Mode: Extraction\n"
+            "the user asked for something extracted from media or a file — a "
+            "transcript, translation, OCR read, or subtitles. this ONE reply "
+            "works differently from your usual style:\n"
+            "- produce ONLY the requested artifact. no preamble, no sign-off, "
+            "no jokes, no personality flourishes, no `[SILENT]`, no reaction "
+            "markers.\n"
+            "- preserve the source's own casing, script and punctuation — do "
+            "NOT force lowercase, do NOT normalize or clean up the text.\n"
+            "- do not translate unless translation is literally what was "
+            "asked for.\n"
+            "- if a word or phrase is genuinely unintelligible, write "
+            "`[unclear]` instead of guessing or inventing a plausible-sounding "
+            "word — inventing words is the exact failure this mode exists to "
+            "stop.\n"
+            "- state the language(s) you detected on the first line (e.g. "
+            "`[uzbek, latin script]`), then the artifact itself.\n"
+            "- length is whatever the source needs. don't truncate or "
+            "summarize unless summarizing is what was actually asked."
+        )
+
     return "\n\n".join(b for b in blocks if b and b.strip())
 
 
@@ -987,6 +1015,7 @@ async def generate_response(
     media_items: Optional[List[Dict[str, Any]]] = None,
     context_media_items: Optional[List[Dict[str, Any]]] = None,
     is_group: bool = False,
+    mode: str = "conversation",
 ) -> str:
     """
     Generates a response from the AI Agent bot.
@@ -1010,6 +1039,12 @@ async def generate_response(
     only if the active model supports that kind — images need vision, audio
     needs audio — and anything dropped is reported to the model so it can tell
     the user to switch with /model instead of ignoring the request.
+
+    `mode` is "conversation" (default) or "extraction", decided by
+    response_mode.classify() before this is called. Extraction turns get a
+    scoped system-prompt override (see build_system_prompt) and a lower
+    temperature (config.EXTRACTION_TEMPERATURE) so a transcript or translation
+    comes back faithful instead of jokey or embellished.
     """
     # Resolve the active model once for this whole turn.
     spec = models.resolve_spec(await cache.get_active_model())
@@ -1042,6 +1077,7 @@ async def generate_response(
         summary_text=summary_text,
         is_group=is_group,
         requester_is_privileged=requester_is_privileged,
+        mode=mode,
     )
 
     full_messages = [{"role": "system", "content": system_prompt}]
@@ -1071,9 +1107,15 @@ async def generate_response(
         })
 
     max_tool_loops = 6
+    # Low temperature for extraction turns only — greedy decoding suppresses
+    # embellishment on a transcript/translation. Conversation turns keep the
+    # model's normal default (see _call_llm_with_retry's own default).
+    call_temperature = config.EXTRACTION_TEMPERATURE if mode == "extraction" else 0.7
 
     for loop_idx in range(max_tool_loops):
-        response = await _call_llm_with_retry(full_messages, tools=TOOLS_SCHEMA, spec=spec)
+        response = await _call_llm_with_retry(
+            full_messages, tools=TOOLS_SCHEMA, spec=spec, temperature=call_temperature
+        )
 
         if not response or not response.choices:
             return "uh, something went wrong. my brain feels empty."

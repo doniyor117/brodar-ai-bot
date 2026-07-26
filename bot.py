@@ -19,6 +19,7 @@ import cache
 import agent
 import models
 import tools
+import response_mode
 
 logger = logging.getLogger(__name__)
 
@@ -572,6 +573,44 @@ async def send_long_reply(message: Message, text: str) -> None:
             first = False
         else:
             await message.answer(chunk)
+
+
+async def send_extraction_result(message: Message, text: str) -> None:
+    """
+    Delivers an extraction-mode reply (transcript/translation/OCR/subtitles).
+
+    Short results go through send_long_reply as normal. Past
+    EXTRACTION_CHUNK_OVERFLOW chunks (~3 Telegram messages), pasting the whole
+    thing into chat is worse than useless — it's a wall of text split across
+    several messages with no way to skim it — so it's written to a file and
+    delivered as a document instead, with a one-line note in chat.
+    """
+    if not text:
+        await send_long_reply(message, text)
+        return
+
+    chunk_count = -(-len(text) // TELEGRAM_MAX_MESSAGE_LEN)  # ceil div
+    if chunk_count <= config.EXTRACTION_CHUNK_OVERFLOW:
+        await send_long_reply(message, text)
+        return
+
+    try:
+        gen_dir = os.path.join(config.TOOL_WORKSPACE_DIR, "generated")
+        os.makedirs(gen_dir, exist_ok=True)
+        ts = int(time.time())
+        file_path = os.path.join(gen_dir, f"transcript-{ts}.txt")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+        from aiogram.types import FSInputFile
+        first_line = text.split("\n", 1)[0][:120]
+        await message.reply_document(
+            FSInputFile(file_path),
+            caption=f"{first_line}\n({chunk_count} messages worth — sending as a file instead)",
+        )
+    except Exception as e:
+        logger.error(f"Failed to deliver extraction overflow as a file: {e}")
+        await send_long_reply(message, text)
 
 
 async def is_user_privileged(message: Message, bot: Bot, user=None) -> bool:
@@ -1727,8 +1766,14 @@ async def handle_chat_message(message: Message, bot: Bot, album: list = None):
             )
             return
 
+        # Decided once, in code, before the call — not left to the model to
+        # judge its own mode while also trying to stay in character. Requires
+        # BOTH a trigger phrase ("transcribe", "tarjima qil", ...) AND media
+        # this turn or carried over from a recent one.
+        turn_mode = response_mode.classify(cleaned_text, has_media or had_prior_media)
+
         async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
-            logger.info(f"Generating agent response for chat {chat_id}...")
+            logger.info(f"Generating agent response for chat {chat_id} (mode={turn_mode})...")
             bot_reply = await agent.generate_response(
                 history,
                 bot_instance=bot,
@@ -1738,39 +1783,50 @@ async def handle_chat_message(message: Message, bot: Bot, album: list = None):
                 media_items=media_items or None,
                 context_media_items=context_media_items or None,
                 is_group=is_group,
+                mode=turn_mode,
             )
 
-        # ── Control-token parsing ──────────────────────────────────────
-        bot_reply, emoji_reaction, wants_silence = parse_control_tokens(bot_reply)
+        if turn_mode == "extraction":
+            # No control-token parsing, no [SILENT], no reactions, no forced
+            # lowercase — those are all conversational-persona machinery, and
+            # applying any of them to a transcript is exactly the "it clowns
+            # around" bug this mode exists to fix.
+            bot_reply = (bot_reply or "").strip()
+            if not bot_reply:
+                logger.info(f"No text to send (empty extraction reply) in chat {chat_id}")
+                return
+        else:
+            # ── Control-token parsing ──────────────────────────────────
+            bot_reply, emoji_reaction, wants_silence = parse_control_tokens(bot_reply)
 
-        if emoji_reaction:
-            try:
-                from aiogram.types import ReactionTypeEmoji
-                await message.react(reaction=[ReactionTypeEmoji(type="emoji", emoji=emoji_reaction)])
-                logger.info(f"Bot reacted with {emoji_reaction} in chat {chat_id}")
-            except Exception as e:
-                logger.error(f"Failed to react to message in chat {chat_id}: {e}")
+            if emoji_reaction:
+                try:
+                    from aiogram.types import ReactionTypeEmoji
+                    await message.react(reaction=[ReactionTypeEmoji(type="emoji", emoji=emoji_reaction)])
+                    logger.info(f"Bot reacted with {emoji_reaction} in chat {chat_id}")
+                except Exception as e:
+                    logger.error(f"Failed to react to message in chat {chat_id}: {e}")
 
-        # ── [SILENT] interception ──────────────────────────────────────
-        if wants_silence and is_group:
-            # Model chose to stay silent. User message is already in history.
-            logger.info(f"[SILENT] Model chose silence in chat {chat_id}")
-            return
+            # ── [SILENT] interception ───────────────────────────────────
+            if wants_silence and is_group:
+                # Model chose to stay silent. User message is already in history.
+                logger.info(f"[SILENT] Model chose silence in chat {chat_id}")
+                return
 
-        if wants_silence and not bot_reply:
-            # A DM: silence isn't an option here, and the token stripped the
-            # whole reply. Ask rather than send nothing — but if it also reacted,
-            # the reaction alone is a complete answer.
-            if not emoji_reaction:
-                bot_reply = "hmm?"
+            if wants_silence and not bot_reply:
+                # A DM: silence isn't an option here, and the token stripped the
+                # whole reply. Ask rather than send nothing — but if it also
+                # reacted, the reaction alone is a complete answer.
+                if not emoji_reaction:
+                    bot_reply = "hmm?"
 
-        if config.FORCE_LOWERCASE:
-            bot_reply = enforce_lowercase(bot_reply)
+            if config.FORCE_LOWERCASE:
+                bot_reply = enforce_lowercase(bot_reply)
 
-        # Reaction-only turn: nothing left to send.
-        if not bot_reply:
-            logger.info(f"No text to send (only reaction) in chat {chat_id}")
-            return
+            # Reaction-only turn: nothing left to send.
+            if not bot_reply:
+                logger.info(f"No text to send (only reaction) in chat {chat_id}")
+                return
 
         # Natural typing delay (Fast human: ~25 chars/sec)
         generation_time = time.time() - start_time
@@ -1795,7 +1851,10 @@ async def handle_chat_message(message: Message, bot: Bot, album: list = None):
             {"role": "assistant", "content": bot_reply},
         ])
 
-        await send_long_reply(message, bot_reply)
+        if turn_mode == "extraction":
+            await send_extraction_result(message, bot_reply)
+        else:
+            await send_long_reply(message, bot_reply)
 
         # After replying, check if the context grew past the token threshold and
         # compact in the background (it makes its own LLM call — don't block).

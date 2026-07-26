@@ -118,6 +118,30 @@ MEDIA_MAX_TURN_BYTES = int(os.getenv("MEDIA_MAX_TURN_BYTES", str(12 * 1024 * 102
 # How long to wait for the rest of a Telegram album before answering it.
 MEDIA_ALBUM_WINDOW = float(os.getenv("MEDIA_ALBUM_WINDOW", "1.2"))
 
+# ── Task modes: extraction vs conversation ─────────────────────────────────
+# Phrases (any language the group actually speaks) that mark a turn as asking
+# for something pulled verbatim out of media/a file, rather than ordinary chat.
+# Matched case-insensitively as a substring against the user's own message text
+# by response_mode.classify(). Comma-separated so it's tunable without a deploy.
+EXTRACTION_TRIGGERS = os.getenv(
+    "EXTRACTION_TRIGGERS",
+    "transcribe,transcript,transcription,translate,translation,verbatim,"
+    "word for word,ocr,read the text,extract the text,extract this,subtitle,"
+    "subtitles,what does it say,what does this say,"
+    "transkripsiya,transkript,tarjima qil,tarjima qilib ber,yozib ber,"
+    "matnini yoz,matnini chiqar,subtitr,"
+    "расшифруй,расшифровка,переведи,перевод,транскрипт,текст с,субтитры,"
+    "слово в слово,таржима қил,ёзиб бер,матнини ёз"
+)
+# Temperature for extraction-mode turns only — low, for greedy/faithful output.
+# Conversation turns are unaffected and keep the model's own default. This is a
+# documented tradeoff against Google's "leave Gemini 3 at 1.0" guidance, hence
+# an env var rather than a hardcoded constant.
+EXTRACTION_TEMPERATURE = float(os.getenv("EXTRACTION_TEMPERATURE", "0.2"))
+# A chunked reply longer than this many 4096-char Telegram messages is instead
+# written to a file and delivered as a document, with a one-line note in chat.
+EXTRACTION_CHUNK_OVERFLOW = int(os.getenv("EXTRACTION_CHUNK_OVERFLOW", "3"))
+
 # Database configurations
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
