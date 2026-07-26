@@ -6,3 +6,4 @@ venv/
 *.log
 workspace/*
 !workspace/README.txt
+PERSONA.md.bak

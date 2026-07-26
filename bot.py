@@ -310,6 +310,95 @@ TELEGRAM_MAX_MESSAGE_LEN = 4096
 # to history so the bot retains context.
 SILENT_TOKEN = "[SILENT]"
 
+# The exact emoji Telegram accepts for message reactions, verbatim from the Bot
+# API's ReactionTypeEmoji (73 of them). Anything else is rejected server-side,
+# which is why reactions felt random: the model would pick a plausible emoji, the
+# API would refuse it, and the failure was only visible in the logs. Note 😂 is
+# NOT accepted — only 🤣 — and 😂 was exactly what the old examples taught.
+TELEGRAM_REACTION_EMOJI = (
+    "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯",
+    "😱", "🤬", "😢", "🎉", "🤩", "🤮", "💩", "🙏", "👌",
+    "🕊", "🤡", "🥱", "🥴", "😍", "🐳", "❤️‍🔥", "🌚", "🌭",
+    "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨", "😐", "🍓",
+    "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨‍💻",
+    "👀", "🎃", "🙈", "😇", "😨", "🤝", "✍", "🤗", "🫡",
+    "🎅", "🎄", "☃", "💅", "🤪", "🗿", "🆒", "💘", "🙉",
+    "🦄", "😘", "💊", "🙊", "😎", "👾", "🤷‍♂️", "🤷", "🤷‍♀️",
+    "😡",
+)
+
+_VARIATION_SELECTOR = "️"
+
+
+def _fold_emoji(s: str) -> str:
+    """Strip U+FE0F so "❤️" and "❤" compare equal."""
+    return s.replace(_VARIATION_SELECTOR, "")
+
+# Folded form -> the canonical spelling Telegram expects back. A model will
+# happily emit "❤️" where the API wants "❤" (and "❤‍🔥" where it wants the
+# VS16-bearing "❤️‍🔥"): visually identical, different bytes, silently rejected.
+# Matching is done folded; what we send is always the canonical string.
+_REACTION_LOOKUP = {_fold_emoji(e): e for e in TELEGRAM_REACTION_EMOJI}
+
+# All |[emoji]| markers, anywhere in the reply — not just the first.
+_REACTION_RE = _re.compile(r"\|\[(.*?)\]\|", _re.DOTALL)
+
+
+def normalize_reaction(raw: str):
+    """
+    Validate a model-proposed reaction against Telegram's fixed set.
+
+    Returns the canonical emoji string to send, or None if Telegram wouldn't
+    accept it — in which case we skip the reaction rather than let the API call
+    fail.
+    """
+    if not raw:
+        return None
+    candidate = _fold_emoji(raw.strip())
+    if not candidate:
+        return None
+    if candidate in _REACTION_LOOKUP:
+        return _REACTION_LOOKUP[candidate]
+    # The model sometimes appends a word, e.g. "|[🔥 nice]|". Accept the leading
+    # emoji on its own if that alone is valid.
+    for width in (3, 2, 1):
+        if len(candidate) >= width and candidate[:width] in _REACTION_LOOKUP:
+            return _REACTION_LOOKUP[candidate[:width]]
+    logger.info(f"Discarding reaction {raw!r}: not in Telegram's accepted set.")
+    return None
+
+
+def parse_control_tokens(reply: str) -> tuple:
+    """
+    Strip brodar's control tokens out of a reply.
+
+    Returns (clean_text, reaction_emoji_or_None, wants_silence).
+
+    Both tokens used to be matched positionally — the reaction with a single
+    `re.search` (first occurrence only) and [SILENT] with `.startswith`. A model
+    that emitted either one anywhere else leaked it to the user as literal text,
+    e.g. a reply ending in "...anyway [SILENT]". Every occurrence is removed
+    here, wherever it appears.
+    """
+    if not reply:
+        return "", None, False
+
+    reaction = None
+    for match in _REACTION_RE.finditer(reply):
+        if reaction is None:
+            reaction = normalize_reaction(match.group(1))
+    reply = _REACTION_RE.sub("", reply)
+
+    wants_silence = SILENT_TOKEN in reply
+    if wants_silence:
+        reply = reply.replace(SILENT_TOKEN, "")
+
+    # Collapse the whitespace the removed tokens left behind.
+    reply = _re.sub(r"[ \t]{2,}", " ", reply)
+    reply = _re.sub(r"\n{3,}", "\n\n", reply).strip()
+
+    return reply, reaction, wants_silence
+
 # ── Bot-to-bot loop detection ──────────────────────────────────────────────
 # Server-side safety net: if recent history looks like two bots talking to each
 # other in AI-formal tone, skip the LLM call entirely to save tokens.
@@ -349,11 +438,23 @@ def _looks_like_bot_loop(history: list, threshold: int = BOT_LOOP_THRESHOLD) -> 
             return False
     return False
 
-# Spans we must NOT lowercase: fenced code, inline code, and URLs. Everything
-# else in a conversational reply gets forced to lowercase to keep brodar in
-# character even when the flash model slips.
+# Spans we must NOT lowercase: fenced code, inline code, URLs, @usernames and
+# Telegram chat/user IDs. Everything else in a conversational reply gets forced
+# to lowercase to keep brodar in character even when the flash model slips.
+#
+# The identifiers matter because the bot is routinely asked to look up a user or
+# group id and hand it back — lowercasing "@BobSmith" produced a handle that
+# doesn't resolve, so the answer looked right and was useless.
 import re as _re
-_PROTECTED_SPAN_RE = _re.compile(r"(```.*?```|`[^`]*`|https?://\S+|www\.\S+)", _re.DOTALL)
+_PROTECTED_SPAN_RE = _re.compile(
+    r"(```.*?```"          # fenced code block
+    r"|`[^`]*`"            # inline code
+    r"|https?://\S+"       # url
+    r"|www\.\S+"           # bare www url
+    r"|@[A-Za-z0-9_]{4,}"  # @username
+    r"|-?\d{6,})",         # chat id / user id
+    _re.DOTALL,
+)
 
 # Matches a protected region whose internal newlines must stay bare in the
 # rich-message path: a fenced code block (```...```) OR a GFM pipe-table block
@@ -1372,14 +1473,11 @@ async def handle_chat_message(message: Message, bot: Bot):
                 show_tool_notes=show_tool_notes,
                 image_urls=image_urls or None,
                 context_image_urls=context_image_urls or None,
+                is_group=is_group,
             )
 
-        # ── Reactions parsing ──────────────────────────────────────
-        reaction_match = _re.search(r'\|\[(.*?)\]\|', bot_reply)
-        emoji_reaction = None
-        if reaction_match:
-            emoji_reaction = reaction_match.group(1).strip()
-            bot_reply = bot_reply.replace(reaction_match.group(0), "").strip()
+        # ── Control-token parsing ──────────────────────────────────────
+        bot_reply, emoji_reaction, wants_silence = parse_control_tokens(bot_reply)
 
         if emoji_reaction:
             try:
@@ -1390,23 +1488,22 @@ async def handle_chat_message(message: Message, bot: Bot):
                 logger.error(f"Failed to react to message in chat {chat_id}: {e}")
 
         # ── [SILENT] interception ──────────────────────────────────────
-        if is_group and bot_reply.strip().startswith(SILENT_TOKEN):
+        if wants_silence and is_group:
             # Model chose to stay silent. User message is already in history.
             logger.info(f"[SILENT] Model chose silence in chat {chat_id}")
             return
 
-        # Strip any accidental [SILENT] prefix in DMs (should never happen,
-        # but if it does, just remove it and send the rest).
-        if bot_reply.strip().startswith(SILENT_TOKEN):
-            bot_reply = bot_reply.strip()[len(SILENT_TOKEN):].strip()
-            if not bot_reply and not emoji_reaction:
+        if wants_silence and not bot_reply:
+            # A DM: silence isn't an option here, and the token stripped the
+            # whole reply. Ask rather than send nothing — but if it also reacted,
+            # the reaction alone is a complete answer.
+            if not emoji_reaction:
                 bot_reply = "hmm?"
 
         if config.FORCE_LOWERCASE:
             bot_reply = enforce_lowercase(bot_reply)
 
-        # If the model chose silence and only wanted to react, we can just return here
-        # (This is for DMs mostly since group silences are caught earlier, but just in case)
+        # Reaction-only turn: nothing left to send.
         if not bot_reply:
             logger.info(f"No text to send (only reaction) in chat {chat_id}")
             return

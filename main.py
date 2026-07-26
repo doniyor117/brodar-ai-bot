@@ -95,6 +95,9 @@ async def lifespan(app: FastAPI):
             await db.init_db_pool()
             import memory
             await memory.sync_memory_from_db()
+            # Runtime persona edits live in the DB too, otherwise every redeploy
+            # silently reverted an admin's change back to the committed file.
+            await memory.sync_persona_from_db()
         except Exception as e:
             logger.critical(
                 f"Failed to initialize the database during startup: {e}. "
