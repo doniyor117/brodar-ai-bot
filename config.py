@@ -241,7 +241,7 @@ def validate_config(exit_on_error: bool = True) -> list:
         print(
             "WARNING: MAIN_ACCOUNT_ID is not set. Approval prompts will fall back to "
             f"the first ALLOWED_DM_USER_IDS entry ({ALLOWED_DM_USER_IDS[0] if ALLOWED_DM_USER_IDS else 'none — approvals will fail closed'}). "
-            "Run /setmain to fix this.",
+            "Run /set_main_account to fix this.",
             file=sys.stderr,
         )
 

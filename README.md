@@ -1,177 +1,219 @@
-# Telegram AI Agent Bot
+# Brodar — Telegram AI Companion Bot
 
-A group-chat capable Telegram AI Bot with tool-calling capabilities (web search, sandboxed system commands) and conversational memory. Powered by **Zhipu AI (Z.ai) GLM-4.7-Flash** (permanently free tier) and backed by a **Neon serverless Postgres** database with an in-memory write-through cache to maximize performance and preserve free-tier limits.
+A group-and-DM capable Telegram AI bot with tool-calling (web search, a sandboxed
+shell, group moderation, member lookup, skill loading), multimodal understanding
+(vision + audio via Gemini), persistent memory, and a human-in-the-loop approval
+system for anything destructive. Routed through **LiteLLM** across two providers —
+**Z.ai (GLM-4.7 Flash)** for text, **Gemini 3.x Flash-Lite** for vision/audio — and
+backed by **Neon serverless Postgres** with an in-memory write-through cache.
 
 ---
 
 ## Technical Stack
-* **Framework**: `aiogram 3.x` (Asynchronous Telegram Bot API)
-* **Web Server**: `FastAPI` (with Uvicorn)
-* **AI Engine**: `zai-sdk` using `glm-4.7-flash` (with fallback configured via env vars)
-* **Search Engine**: `ddgs` (DuckDuckGo search wrapper)
-* **Database**: `Neon Postgres` (via `asyncpg` connection pooling)
-* **Deployment**: `Render` Free Tier + optional `UptimeRobot`
+* **Framework**: `aiogram 3.x` (async Telegram Bot API), webhook-driven
+* **Web Server**: `FastAPI` + `uvicorn`
+* **AI Engine**: `litellm`, one unified interface across every model. See `models.py`
+  for the registry — GLM-4.7 Flash (text only) and two Gemini Flash-Lite models
+  (vision + audio), switchable at runtime with `/model`.
+* **Search**: `ddgs` (DuckDuckGo), with optional Exa neural search if `EXA_API_KEY` is set
+* **Media**: `ffmpeg` (via `imageio-ffmpeg`, no system package needed) — frame
+  extraction for video/GIF, 16kHz mono FLAC re-encoding for speech
+* **Database**: Neon Postgres via `asyncpg`, schema auto-created on startup
+* **Deployment**: Render free tier + `UptimeRobot` for keep-alive
 
 ---
 
 ## 1. Project Directory Structure
 ```text
 brodar-ai-bot/
-├── MEMORY.md               # Persistent memory file storing persona, facts, and learned rules
-├── skills/                 # Hermes-style SKILL.md instruction directory
-│   ├── jailbreak_roast/    # Skill for playful jailbreak defense & roasting
-│   ├── system_diagnostics/ # Skill for server diagnostics & monitoring
-│   └── web_research/       # Skill for real-time web research
-├── skills.py               # Dynamic SKILL.md loader & parser
-├── memory.py               # MEMORY.md & Neon DB memory manager
-├── config.py               # Configuration loader & validator
-├── db.py                   # asyncpg database connection pooler & CRUD
-├── cache.py                # In-memory write-through caching layer
-├── tools.py                # Whitelisted command runner (ping, uptime, df, whoami, date, uname, free, ps, git, curl) & DDGS search
-├── agent.py                # LLM agent loop, MEMORY.md injection, & tool routing
-├── bot.py                  # aiogram AccessControlMiddleware, filters, & command handlers
-├── main.py                 # FastAPI entry point & webhook endpoints
-├── requirements.txt        # Python package dependencies
-├── .env.example            # Environment configuration template
-└── README.md               # Technical documentation
+├── PERSONA.md               # The bot's fixed identity/voice/rules (code-owned)
+├── MEMORY.md                # Mutable learned facts, editable by admins/the bot itself
+├── skills/                  # Hermes-style SKILL.md instruction directory
+│   ├── bot-architecture/    # This file's in-chat equivalent — self-debugging map
+│   ├── group_admin/         # Moderation actions and the approval rules around them
+│   ├── telegram-directory/  # What member/id lookups can and can't answer
+│   ├── web_research/        # When to search vs. answer from memory
+│   ├── send-media/          # Delivering files back to the chat
+│   ├── chart-generation/, image-generation/, jailbreak_roast/, system_diagnostics/
+├── config.py                 # Env var loading, validation, and small derived helpers
+├── db.py                     # asyncpg pool + schema + all SQL (chat settings, history,
+│                              #   chat_members incl. Cyrillic/Latin fold, visuals, sessions)
+├── cache.py                  # In-memory write-through layer in front of db.py
+├── models.py                 # The model registry LiteLLM calls route through
+├── media.py                  # ffmpeg wrapper: frame extraction, audio re-encoding
+├── response_mode.py          # Per-turn "extraction vs conversation" classifier
+├── tools.py                  # Sandboxed shell (whitelisted commands) + web search
+├── group_tools.py            # Every Bot-API moderation call (ban/mute/permissions/
+│                              #   invite links/join requests/forum topics/...)
+├── skills.py                 # SKILL.md discovery, caching, install/uninstall
+├── memory.py                 # PERSONA.md / MEMORY.md read-write + Postgres sync
+├── session_manager.py        # Multi-session support and context-compaction checkpoints
+├── agent.py                  # System prompt builder, tool schema, tool-execution
+│                              #   loop, and the approval flow
+├── bot.py                    # aiogram router: middleware, commands, message handling,
+│                              #   join/leave tracking, approval callback
+├── main.py                   # FastAPI app, webhook endpoint, startup/shutdown
+├── requirements.txt
+├── .env.example
+├── run_tests.py               # Runs every test_phaseN.py suite in sequence
+└── test_phase*.py, test_support.py   # Dependency-free test suites (see below)
 ```
 
 ---
 
-## 2. Neon Postgres Database Setup & Schema
-The full schema (all tables **and** indexes) is created automatically on startup
-by `db.init_schema()` — you do **not** need to run any SQL by hand. Just point
-`DATABASE_URL` at your Neon database and start the app.
+## 2. Database Schema
 
-The SQL below is provided for reference / manual inspection only:
+The full schema is created automatically on startup by `db.init_schema()` — you
+never run SQL by hand. Point `DATABASE_URL` at a Neon database and start the app.
+The tables that actually exist (see `db.py:SCHEMA_STATEMENTS` for the authoritative
+source, including every index and migration):
 
-```sql
--- 1. Create the Chats table to persist reply preferences and activation state
-CREATE TABLE IF NOT EXISTS chats (
-    chat_id BIGINT PRIMARY KEY,
-    mention_only BOOLEAN DEFAULT TRUE NOT NULL,
-    is_active BOOLEAN DEFAULT FALSE NOT NULL
-);
-
--- 2. Create the Allowed Users table for dynamic DM access control
-CREATE TABLE IF NOT EXISTS allowed_users (
-    user_id BIGINT PRIMARY KEY,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-);
-
--- 3. Create the Messages table for long-term chat histories
-CREATE TABLE IF NOT EXISTS messages (
-    id SERIAL PRIMARY KEY,
-    chat_id BIGINT NOT NULL,
-    role VARCHAR(20) NOT NULL,
-    content TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-);
-
--- 4. Create an index to optimize chronological history retrieval
-CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at 
-ON messages (chat_id, created_at DESC);
-```
+| Table | Holds |
+|---|---|
+| `chats` | Per-chat settings: activation, mention-only mode, tool-notes toggle, turn counters |
+| `messages` | Long-term conversation history, keyed by chat and insertion order |
+| `allowed_users` | Dynamically DM-allowlisted user ids |
+| `sessions` / `session_summaries` | Multi-session support and compaction checkpoints |
+| `memory_store` | `MEMORY.md` and runtime `PERSONA.md` edits, synced to disk on boot |
+| `recent_visuals` | Retained media (images, extracted frames, audio) for follow-up questions, tagged by kind |
+| `chat_members` | Everyone the bot has seen — via messages, joins/leaves/promotions (`chat_member` updates), or a live `getChatAdministrators` call. Carries a folded `search_key` (lowercased, Cyrillic→Latin) for token-wise name search, and `left_at` (marks departed rather than deleting) |
 
 ---
 
-## 3. How to Obtain Credentials & API Keys
+## 3. How to Obtain Credentials
 
 ### A. Telegram Bot Token
-1. Open Telegram and search for [@BotFather](https://t.me/BotFather).
-2. Send `/newbot` and follow the prompts to name your bot.
-3. Save the HTTP API Token provided (looks like `123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ`).
+1. Open Telegram, message [@BotFather](https://t.me/BotFather).
+2. `/newbot`, follow the prompts.
+3. Save the token (`123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ`).
 
-### B. Zhipu AI (Z.ai) API Key
-1. Register/Login on the [Zhipu AI Open Platform](https://open.bigmodel.cn/).
-2. Navigate to the API Key management page on your console dashboard.
-3. Generate a new API Key and copy it.
+### B. Z.ai (GLM) API Key
+1. Register at the [Zhipu AI / Z.ai platform](https://open.bigmodel.cn/).
+2. Generate an API key from the console.
 
-### C. Neon Postgres Database URL
-1. Sign up for a free account on [Neon.tech](https://neon.tech/).
-2. Create a new Postgres project.
-3. Under the **Connection Details** dashboard, copy the Connection String. Choose the `Connection pooler` mode for serverless backends and append `?sslmode=require` if not already present.
+### C. Gemini API Key (needed for vision + audio)
+1. Get one at [Google AI Studio](https://aistudio.google.com/apikey).
+2. Without this set, `models.resolve_spec()` falls back to the text-only GLM model
+   and every image/voice feature silently does nothing — set it before relying on
+   media understanding.
+
+### D. Neon Postgres
+1. Sign up at [Neon.tech](https://neon.tech/), create a project.
+2. Copy the pooled connection string, append `?sslmode=require` if missing.
 
 ---
 
-## 4. Local Development Installation
-To run this bot locally, you will need a tool like **ngrok** to expose your local port `8000` to the internet so Telegram can reach your webhook endpoint.
+## 4. Local Development
 
-1. **Clone/Copy Project Files** and navigate to the directory:
-   ```bash
-   cd telegram_bot
-   ```
+You'll need something like **ngrok** to expose local port 8000 for Telegram's webhook.
 
-2. **Create and Activate a Virtual Environment**:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # fill in the values; see section 3
+python main.py
+```
 
-3. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Set `WEBHOOK_URL` in `.env` to your ngrok URL before starting.
 
-4. **Setup Environment Variables**:
-   Copy `.env.example` to `.env` and fill in the values:
-   ```bash
-   cp .env.example .env
-   ```
-   *Note: Set `WEBHOOK_URL` to your ngrok URL (e.g. `https://1234-abcd.ngrok-free.app`).*
+### Running the tests
 
-5. **Run the Database Migrations** as detailed in Section 2.
+No real Telegram/Postgres/LLM connection needed — `test_support.install_stubs()`
+fakes just enough of `aiogram`/`asyncpg` for the bot's own logic to import and run.
 
-6. **Launch the Server**:
-   ```bash
-   python main.py
-   ```
+```bash
+python3 -m py_compile *.py     # syntax/import sanity
+python3 run_tests.py           # every test_phaseN.py suite, one summary at the end
+python3 test_phase9.py         # or run just one suite directly
+```
 
 ---
 
 ## 5. Deploying to Render (Free Tier)
-Render supports automated infrastructure provisioning using the included `render.yaml` Blueprint file.
 
-1. Push your codebase to a private/public **GitHub repository**.
-2. Go to the [Render Dashboard](https://dashboard.render.com/) and click **New** -> **Blueprint**.
-3. Link your GitHub repository.
-4. Render will parse `render.yaml` and prompt you for the required variables:
-   * `TELEGRAM_BOT_TOKEN`
-   * `ZAI_API_KEY`
-   * `DATABASE_URL`
-   * `WEBHOOK_URL` (Enter your Render App URL, e.g. `https://my-tg-bot.onrender.com`. Leave out trailing slashes and the `/webhook` path).
-   * Note: `WEBHOOK_SECRET_TOKEN` will be generated automatically for you.
-5. Click **Approve** to deploy. Render will automatically install packages and spin up the FastAPI webhook application.
+1. Push to a GitHub repository.
+2. Render Dashboard → **New** → **Blueprint**, link the repo (`render.yaml` is included).
+3. Set the required env vars: `TELEGRAM_BOT_TOKEN`, `ZAI_API_KEY` and/or `GEMINI_API_KEY`,
+   `DATABASE_URL`, `WEBHOOK_URL` (your Render app URL, no trailing slash), `MAIN_ACCOUNT_ID`.
+   `WEBHOOK_SECRET_TOKEN` is generated for you.
+4. Deploy. `config.validate_config()` logs loudly (without crash-looping) if anything
+   required is still missing or a placeholder — check the logs after first boot.
 
----
-
-## 6. Documented System Defaults & Open Decisions
-
-### 1. Shell Command Executor Sandboxing
-The shell tool inside [tools.py](file:///root/.gemini/antigravity-cli/scratch/telegram_bot/tools.py) runs with `shell=False` to neutralize command injection exploits. It enforces a strict timeout of `5.0` seconds and strips secrets out of environment variables.
-* **Default Whitelist**: `ping`, `uptime`, `df`, `whoami`, `date`, and `uname`.
-* **Adding New Commands**: To allow more commands, edit the `ALLOWED_COMMANDS` dictionary in `tools.py`. You must supply the binary name and a strict **regex** pattern validating the parameters. For example:
-  ```python
-  "curl": {
-      "bin": "curl",
-      "args_regex": r"^-[I]\s+https://[a-zA-Z0-9.-]+$" # Only allow curl -I with safe https domains
-  }
-  ```
-
-### 2. Keep-Alive / Cold Starts
-Render's Free Tier spins down web servers after 15 minutes of inactivity, causing a 30-second delay on the next message.
-* **UptimeRobot Keep-Alive**: To keep the bot responsive 24/7, set up a free HTTP ping monitor on [UptimeRobot](https://uptimerobot.com/) targeting `https://your-app.onrender.com/health` every 10 minutes.
-* **Neon Compute Hour Preservation**: Our `/health` endpoint is completely **DB-free** (it does not query Postgres). Therefore, UptimeRobot pings keep the Render server awake but allow the Neon database to sleep after 5 minutes of inactivity, saving Neon's free 100 CU-hours quota.
-
-### 3. Database Layer
-Instead of ORMs (like SQLAlchemy), the project implements a raw SQL connection pool via **`asyncpg`**. It initializes a small pool (maximum 5 connections, closing idle ones after 5 minutes) to ensure optimal response times while avoiding exhausting Neon connections.
-
-### 4. LLM Concurrency Guard
-The Z.ai free tier rate limits request concurrency to 1. To prevent `429` (Too Many Requests) errors, the agent utilizes a global `asyncio.Semaphore(1)` in [agent.py](file:///root/.gemini/antigravity-cli/scratch/telegram_bot/agent.py) to serialize LLM queries. Overlapping messages in group chats are queued and answered sequentially. If peak-hour throttling triggers rate limit responses (`1302` or `1305`), the API client performs up to 5 retries with exponential backoff and random jitter.
+**Two things silently degrade the bot if left unset, with no crash to warn you:**
+- `GEMINI_API_KEY` — without it, the model falls back to text-only GLM and every
+  vision/audio feature does nothing.
+- `MAIN_ACCOUNT_ID` — without it, approvals fall back to the first
+  `ALLOWED_DM_USER_IDS` entry (or fail closed if that's empty too). Set explicitly,
+  or run `/set_main_account` once the bot is live.
 
 ---
 
-## 7. Changelog
+## 6. How the Bot Actually Works
+
+### Task modes: extraction vs conversation
+`response_mode.classify()` decides, per turn, whether the user wants something
+extracted verbatim from media (a transcript, translation, OCR read) or just wants
+to chat. Extraction mode drops the persona's lowercase/joke/brevity rules for that
+one reply, uses a lower LLM temperature (`EXTRACTION_TEMPERATURE`), and — past a
+few Telegram message chunks — delivers the result as a file instead of a wall of
+text. See `PERSONA.md`'s "When You're Given a Job" section and `agent.build_system_prompt()`.
+
+### Media pipeline
+`media.py` extracts JPEG frames from video/GIF/stickers and re-encodes audio to
+16kHz mono FLAC (falling back to 96kbps MP3 only if that overruns a byte budget) —
+lossless at the rate a speech model actually uses, unlike the 32kbps MP3 this used
+to ship with. A language-hint block naming the likely spoken languages
+(`SPEECH_LANGUAGES`, default Uzbek/Russian/English) is injected on any turn
+carrying audio. Truncation (`MEDIA_MAX_AUDIO_SECONDS`) is always reported to the
+user, never silent.
+
+### Approvals
+Destructive or self-modifying tool calls (`kick_ban`, `mute`, `.env`/persona edits,
+skill install/uninstall, ...) require an explicit human tap before they run — see
+`agent._tool_needs_approval()` for the full list. The prompt is sent to
+`config.approval_recipient_id()`'s **DM only**, carrying a provenance card (who it
+affects, where it came from, who asked, the triggering message, what it does), and
+is edited in place with the outcome once resolved — never posted in the group that
+triggered it, and only that one account can tap it.
+
+### Member lookup
+The Bot API has no method to list every member of a group. `search_group_members`
+combines a live `getChatAdministrators` call (always accurate) with the bot's own
+memory of who it's seen (via messages, `chat_member` join/leave/promotion updates,
+or a prior admin check) — with Cyrillic↔Latin name folding so a Latin-typed query
+finds a Cyrillic-stored name. See `skills/telegram-directory/SKILL.md`.
+
+---
+
+## 7. Shell Sandbox
+
+`tools.execute_shell_command` runs with `shell=False`, a hard timeout, and secrets
+stripped from the subprocess environment. Commands are whitelisted in
+`ALLOWED_COMMANDS` (`tools.py`) with a strict regex per command validating
+arguments; a per-chat session remembers `cwd` across calls (bounded, LRU-evicted).
+To add a command, add an entry there with a regex tight enough to reject anything
+that could escape the sandbox or reach `.env`.
+
+---
+
+## 8. Changelog
+
+Entries below are historical — each describes the state *at that date*, not
+necessarily today's. For current behavior, read section 6 and the module docstrings;
+`git log` has the full detail behind every fix.
+
+### Recovery plan, phases 1–9 (2026-07-26)
+A large prior session had added many features that didn't actually work end to end.
+Fixed across nine phases: freeze-prone paths and security holes (unbounded waits,
+no timeouts, a broken shell sandbox); one persona/one prompt builder instead of
+several contradicting blocks; a rebuilt media engine with real audio support;
+task-mode separation so "transcribe this" doesn't get a joke instead of a
+transcript; 16kHz FLAC speech re-encoding with language hints (the old 32kbps MP3
+was why Uzbek came back as Turkish); member lookup that actually finds people
+(Cyrillic/Latin folding, live admin merge, `chat_member` event tracking); and
+approvals that go to the master admin's DM with real provenance instead of the
+group chat, gating every destructive moderation action behind a tap even when an
+admin asks directly. See `git log` for the full per-phase commit messages.
 
 ### Image Generation, Moderation Fixes & Admin Persona (2026-07-25)
 * **Image Generation Native Tool**: Added a robust `image_generate` tool powered by LiteLLM image API, enabling the bot to create custom AI images directly in chat.
@@ -183,7 +225,7 @@ The Z.ai free tier rate limits request concurrency to 1. To prevent `429` (Too M
 ### Exa Web Search, Advanced Terminal & Interactive Approvals (2026-07-25)
 * **Exa Web Search Native Support (`tools.py`)**: Web search natively supports `exa_py` for neural-search AI web results if `EXA_API_KEY` is present in `.env`. Falls back to DuckDuckGo search automatically. No bloated plugins required.
 * **Advanced Terminal Sandbox (`tools.py`)**: The `execute_shell_command` tool now maintains a persistent `cwd` (Current Working Directory) per-chat using a `_terminal_sessions` dict, enabling native `cd` operations and persistent terminal traversal without leaving the sandbox.
-* **Telegram Interactive Approvals (`agent.py`, `bot.py`)**: Execution of strictly privileged tools (such as `.env` modification or downloading skills) now triggers an asynchronous **Inline Keyboard Prompt** (Approve / Deny) directly in the Telegram chat. 
+* **Telegram Interactive Approvals (`agent.py`, `bot.py`)**: Execution of strictly privileged tools (such as `.env` modification or downloading skills) now triggers an asynchronous **Inline Keyboard Prompt** (Approve / Deny) directly in the Telegram chat.
   - Admins can use `/set_main_account` to designate a master account; approvals will route seamlessly to that account's DMs.
 * **Auto-Registered Scoped Commands (`bot.py`)**: The bot automatically registers its command menus to Telegram via `set_my_commands` on startup with scoped visibilities. Private chats see full admin capabilities, while group chats only see basic safe commands (unless you are a group admin). No BotFather manual config needed.
 
@@ -198,7 +240,7 @@ The Z.ai free tier rate limits request concurrency to 1. To prevent `429` (Too M
 * **Neon Postgres Memory Persistence (`memory_store`)**: `MEMORY.md` is now stored persistently in Neon Postgres. Automatically synced to local disk on app startup and updated via async write-through on every memory change, guaranteeing **100% memory persistence across Render container redeploys and restarts**.
 * **Global Emergency Abort (`/stop_all`, `/cancel_all`)**: Immediately halts all running agent tasks, LLM completions, and tool loops across **all chats globally**. Restricted to authorized bot admins.
 * **Group Admin Role Promotion & Demotion (`/promote`, `/demote`)**: Allows promoting members to Group Administrator (via `aiogram 3` `promote_chat_member`) or demoting them back to regular members. Exposed as commands and LLM tool actions.
-* **Telegram Interactive Permission Prompt System ([permissions.py](file:///mnt/projects/brodar-ai-bot/permissions.py))**: Non-whitelisted commands or `.env` file read attempts send an **Inline Keyboard message** with `[ ✅ Approve ]` and `[ ❌ Reject ]` buttons. Restricted to Group Admins in group chats with non-admin toast alerts.
+* **Telegram Interactive Permission Prompt System (`permissions.py`, since removed — superseded by the approval flow in `agent.py`/`bot.py`)**: Non-whitelisted commands or `.env` file read attempts send an **Inline Keyboard message** with `[ ✅ Approve ]` and `[ ❌ Reject ]` buttons. Restricted to Group Admins in group chats with non-admin toast alerts.
 * **Terminal Read Tool Whitelist & `.env` Protection**: Safe diagnostic reading commands (`ls`, `cat`, `grep`, `head`, `tail`, `find`, `df`, `free`, `uptime`, `ps`, `whoami`, `date`, `uname`, `git status`, `git log`, `git diff`) run automatically. Any attempt to read `.env` or `.env.*` files triggers an interactive Permission Prompt.
 * **Agent Self-Management Tools**: Brodar can create/update skill files in `skills/` (`manage_skill_file`) and rewrite persona rules in `MEMORY.md` (`edit_memory_file`).
 
@@ -237,4 +279,3 @@ The Z.ai free tier rate limits request concurrency to 1. To prevent `429` (Too M
   * `/deactivate` (restricted to allowed user IDs): Deactivates the bot in a group chat (silences all responses).
 
 * **Database Updates**: Added the `is_active` boolean column to the `chats` table, defaulting to `FALSE`. Added a migration script segment and updated the cache mechanism to support write-through caching of the active status.
-

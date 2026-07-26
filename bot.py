@@ -322,6 +322,7 @@ async def set_bot_commands(bot: Bot):
 
     # Private chats (DMs) commands
     private_commands = [
+        BotCommand(command="start", description="Say hi / check you're allowlisted"),
         BotCommand(command="help", description="Show what the bot can do"),
         BotCommand(command="status", description="View bot status and uptime"),
         BotCommand(command="clear", description="Reset chat context and history"),
@@ -903,7 +904,7 @@ async def cmd_status(message: Message):
     if config.MAIN_ACCOUNT_ID:
         approval_line = f"- approvals go to: {config.MAIN_ACCOUNT_ID} (MAIN_ACCOUNT_ID)"
     elif recipient:
-        approval_line = f"- approvals go to: {recipient} (fallback — MAIN_ACCOUNT_ID unset, run /setmain)"
+        approval_line = f"- approvals go to: {recipient} (fallback — MAIN_ACCOUNT_ID unset, run /set_main_account)"
     else:
         approval_line = "- approvals go to: NOWHERE — MAIN_ACCOUNT_ID and ALLOWED_DM_USER_IDS both empty, every privileged action will fail closed"
 
