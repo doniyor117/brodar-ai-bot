@@ -437,22 +437,33 @@ TOOLS_SCHEMA = [
         "function": {
             "name": "search_group_members",
             "description": (
-                "Look up people the bot has seen, to get their user id and chat id. "
-                "Search by @username, display name, or a numeric id. Call this before "
-                "any moderation action when you don't already know the user id."
+                "Look up people to get their user id and chat id — searches BOTH the "
+                "people the bot has seen talk AND (when scoped to one group) the live, "
+                "always-accurate admin list from Telegram itself. Search by @username, "
+                "display name (partial and either word order works, Cyrillic or Latin "
+                "script), or a numeric id. Call this before any moderation action when "
+                "you don't already know the user id. There is no way to list literally "
+                "every member of a group — Telegram's API doesn't support that — only "
+                "who the bot has seen, plus the admins."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_chat_id": {
                         "type": "integer",
-                        "description": "Optional. Restrict the search to one group. Omit to search every known chat.",
+                        "description": (
+                            "Optional. Restrict the search to one group. Omit to search "
+                            "the current chat. Only an admin's request may omit this to "
+                            "search every known chat, or point it at a DIFFERENT chat."
+                        ),
                     },
                     "query": {
                         "type": "string",
                         "description": (
-                            "@username, name, or user id to look for. Partial names work. "
-                            "Leave empty only if you genuinely want to list everyone."
+                            "@username, name, or user id to look for. Partial names and "
+                            "surname-first both work. A non-admin's search MUST have a "
+                            "real query — leave empty only for an admin request that "
+                            "genuinely wants to list everyone known."
                         ),
                     },
                 },
@@ -659,8 +670,11 @@ _PRIVILEGED_TOOLS = {
     # me the file called .env" hands out the bot token, DATABASE_URL and every
     # API key. It is additionally confined to the workspace sandbox below.
     "send_file",
-    # An empty query dumps every tracked user id in every chat the bot has seen.
-    "search_group_members",
+    # search_group_members is deliberately NOT here: a scoped, non-empty search
+    # ("who is @bob", "find aziz") is fine for anyone in their own chat — it's
+    # the same thing @userinfobot does. Only the "dump every id in every chat
+    # the bot has ever seen" shape needs privilege, and that's gated inline at
+    # its call site below instead of blocked wholesale.
 }
 
 # Privileged tools that additionally require an explicit human approval tap.
@@ -1298,7 +1312,28 @@ async def generate_response(
             elif tool_name == "group_moderation_tool":
                 tool_result = await _run_moderation(bot_instance, chat_id, args)
             elif tool_name == "search_group_members":
-                tool_result = await _run_member_search(chat_id, args)
+                query_str = (args.get("query") or "").strip()
+                target_chat_id = (
+                    _safe_int(args.get("target_chat_id"))
+                    if args.get("target_chat_id") is not None else None
+                )
+                if requester_is_privileged:
+                    # Full power preserved: an admin may omit target_chat_id to
+                    # search every chat the bot has ever seen, or point it at a
+                    # different group entirely (moderating remotely from a DM).
+                    tool_result = await _run_member_search(bot_instance, chat_id, args)
+                elif _member_search_own_scope_ok(chat_id, target_chat_id, query_str):
+                    # Open to everyone, but force-scoped to the caller's OWN
+                    # chat regardless of what was passed — same thing
+                    # @userinfobot does, never a cross-chat or full-dump search.
+                    scoped_args = dict(args, target_chat_id=chat_id)
+                    tool_result = await _run_member_search(bot_instance, chat_id, scoped_args)
+                else:
+                    tool_result = (
+                        "Permission Denied: only an admin can list every member, "
+                        "search with an empty query, or search a different chat. "
+                        "Tell the user they can search THIS chat with a specific name."
+                    )
             elif tool_name == "image_generate":
                 prompt_text = args.get("prompt", "")
                 try:
@@ -1514,7 +1549,22 @@ async def _run_moderation(bot_instance, chat_id: Optional[int], args: Dict[str, 
     )
 
 
-async def _run_member_search(chat_id: Optional[int], args: Dict[str, Any]) -> str:
+def _member_search_own_scope_ok(
+    chat_id: Optional[int], target_chat_id: Optional[int], query_str: str,
+) -> bool:
+    """
+    True if a NON-privileged caller's search_group_members request is a
+    legitimate "who is X in this chat" lookup — the same thing @userinfobot
+    does — rather than an empty-query dump or a different chat's roster.
+
+    A pure predicate so the privilege split is directly unit-testable without
+    standing up the whole tool-dispatch loop.
+    """
+    query_str = (query_str or "").strip()
+    return bool(query_str) and (target_chat_id is None or target_chat_id == chat_id)
+
+
+async def _run_member_search(bot_instance: Optional[Any], chat_id: Optional[int], args: Dict[str, Any]) -> str:
     """
     Look up chat members, returning explicit chat_id / user_id fields.
 
@@ -1522,32 +1572,78 @@ async def _run_member_search(chat_id: Optional[int], args: Dict[str, Any]) -> st
     the model to parse ids back out of a sentence — and it keyed results by user
     id alone, so the same person in two groups collapsed into one row and the
     bot would try to ban them in the wrong chat.
+
+    When the search is scoped to one group, this also pulls the LIVE admin
+    roster via group_tools.list_admins() and merges it in ahead of the stored
+    matches — the one member question the Bot API can answer perfectly, unlike
+    a general "list everyone" which the API has no method for at all. Each
+    admin found this way is upserted back into chat_members with a confirmed
+    is_admin flag, so one lookup permanently seeds the table.
     """
+    import group_tools
+
     scope_chat_id = _safe_int(args.get("target_chat_id")) if args.get("target_chat_id") is not None else None
     query = (args.get("query") or "").strip()
-
-    rows = await cache.search_users(scope_chat_id, query, limit=26)
     scope = f"chat {scope_chat_id}" if scope_chat_id else "all known chats"
 
-    if not rows:
+    admin_section = ""
+    if bot_instance is not None and scope_chat_id is not None:
+        try:
+            roster = await group_tools.list_admins(bot_instance, scope_chat_id)
+        except Exception as e:
+            logger.warning(f"list_admins failed for chat {scope_chat_id}: {e}")
+            roster = {"ok": False, "admins": [], "member_count": None}
+
+        if roster.get("ok"):
+            for a in roster["admins"]:
+                cache.track_user(
+                    scope_chat_id, a["user_id"], a["full_name"] or "",
+                    username=a["username"], is_bot=a["is_bot"], is_admin=True,
+                )
+            admin_lines = []
+            if roster.get("member_count") is not None:
+                admin_lines.append(f"total members: {roster['member_count']}")
+            for a in roster["admins"]:
+                tag = "creator" if a["status"] == "creator" else "admin"
+                handle = f"@{a['username']}" if a["username"] else "(no username)"
+                title = f" (\"{a['custom_title']}\")" if a.get("custom_title") else ""
+                admin_lines.append(
+                    f"- [{tag}]{title} {a['full_name'] or '(no name)'} | {handle} | "
+                    f"user_id: {a['user_id']}"
+                )
+            if admin_lines:
+                admin_section = f"Live admin roster for {scope}:\n" + "\n".join(admin_lines) + "\n\n"
+
+    rows = await cache.search_users(scope_chat_id, query, limit=26)
+
+    if not rows and not admin_section:
         return (
             f"No members found in {scope} matching '{query}'. "
-            "The bot only knows people it has seen send a message. Ask the admin "
-            "to have them say something, or to forward one of their messages."
+            "The bot only knows people it has seen send a message, plus whoever "
+            "the live admin check above found (if any). There is no Bot API method "
+            "to list every member of a group — ask the admin to have the person say "
+            "something, or to forward one of their messages."
         )
+    if not rows:
+        return admin_section.rstrip()
 
     truncated = len(rows) > 25
     lines = []
     for r in rows[:25]:
         name = r.get("full_name") or "(no name)"
         handle = f"@{r['username']}" if r.get("username") else "(no username)"
-        tag = " [BOT]" if r.get("is_bot") else ""
+        tags = []
+        if r.get("is_bot"):
+            tags.append("BOT")
+        if r.get("is_admin"):
+            tags.append("admin")
+        tag = f" [{', '.join(tags)}]" if tags else ""
         lines.append(
             f"- name: {name} | username: {handle} | "
             f"user_id: {r['user_id']} | chat_id: {r['chat_id']}{tag}"
         )
 
-    out = f"Members found in {scope}:\n" + "\n".join(lines)
+    out = admin_section + f"Members found in {scope} matching '{query}':\n" + "\n".join(lines)
     if truncated:
         out += "\n(more matches exist — narrow the query)"
     return out

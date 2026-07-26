@@ -10,6 +10,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
     Message, TelegramObject, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    ChatMemberUpdated, ChatJoinRequest,
 )
 from aiogram.utils.chat_action import ChatActionSender
 import re as _re
@@ -226,6 +227,63 @@ router.message.outer_middleware(AccessControlMiddleware())
 
 # Global cache for the bot's own username to prevent redundant API calls
 BOT_USERNAME = None
+
+
+@router.chat_member()
+async def handle_chat_member_update(update: ChatMemberUpdated) -> None:
+    """
+    Tracks joins, leaves, and promotion/demotion — the only source of member
+    data the bot doesn't have to wait for someone to talk to get.
+
+    This handler's mere existence is what makes chat_member updates arrive at
+    all. Telegram excludes them from allowed_updates by default, and
+    dp.resolve_used_update_types() (what main.py's set_webhook call passes)
+    only requests update types that have at least one registered handler —
+    with none registered, joins/leaves/promotions were never delivered and the
+    member table only ever learned about people who happened to talk.
+    """
+    chat = update.chat
+    new = update.new_chat_member
+    if chat.type not in ("group", "supergroup") or new is None or new.user is None:
+        return
+
+    user = new.user
+    if new.status in ("left", "kicked"):
+        cache.mark_member_left(chat.id, user.id)
+        return
+
+    is_admin = new.status in ("administrator", "creator")
+    cache.track_user(
+        chat.id, user.id, user.full_name or (f"@{user.username}" if user.username else str(user.id)),
+        username=user.username, is_bot=bool(user.is_bot), is_admin=is_admin,
+    )
+
+
+@router.my_chat_member()
+async def handle_my_chat_member_update(update: ChatMemberUpdated) -> None:
+    """Logs the bot's own membership/admin-status changes in a chat."""
+    old = update.old_chat_member
+    new = update.new_chat_member
+    logger.info(
+        f"Bot membership in chat {update.chat.id} changed: "
+        f"{getattr(old, 'status', '?')} -> {getattr(new, 'status', '?')}"
+    )
+
+
+@router.chat_join_request()
+async def handle_chat_join_request(update: ChatJoinRequest) -> None:
+    """
+    Logs pending join requests.
+
+    Registered now so the update type is requested via allowed_updates (see
+    handle_chat_member_update's docstring); approve/decline moderation tools
+    land in a later phase.
+    """
+    user = update.from_user
+    logger.info(
+        f"Join request in chat {update.chat.id} from user {user.id if user else '?'} "
+        f"(@{user.username if user and user.username else 'no username'})."
+    )
 
 # Strong refs to background maintenance tasks (auto-compaction) so the GC can't
 # cancel them mid-run.

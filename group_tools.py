@@ -202,6 +202,42 @@ async def promote_to_admin(bot: Bot, chat_id: int, user_id: int, title: str = "A
         logger.error(f"Error promoting user {user_id} in chat {chat_id}: {e}")
         return f"Failed to promote user {user_id}: {e}"
 
+async def list_admins(bot: Bot, chat_id: int) -> dict:
+    """
+    Live admin roster + total member count, straight from the Bot API.
+
+    This is the one member question the API can answer perfectly. The Bot API
+    has no method to enumerate every member of a chat at all — only
+    getChatAdministrators, getChatMember (needs an id you already have), and
+    getChatMemberCount — so this is also the most reliable way to (re)seed the
+    chat_members table with confirmed admin status.
+    """
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+    except Exception as e:
+        logger.error(f"Error fetching admins for chat {chat_id}: {e}")
+        return {"ok": False, "error": str(e), "admins": [], "member_count": None}
+
+    member_count = None
+    try:
+        member_count = await bot.get_chat_member_count(chat_id)
+    except Exception as e:
+        logger.warning(f"Error fetching member count for chat {chat_id}: {e}")
+
+    rows = []
+    for m in admins:
+        user = m.user
+        rows.append({
+            "user_id": user.id,
+            "username": user.username,
+            "full_name": user.full_name,
+            "is_bot": user.is_bot,
+            "status": m.status,  # "creator" or "administrator"
+            "custom_title": getattr(m, "custom_title", None),
+        })
+    return {"ok": True, "admins": rows, "member_count": member_count}
+
+
 async def demote_from_admin(bot: Bot, chat_id: int, user_id: int) -> str:
     """Demotes a group administrator back to regular member."""
     try:

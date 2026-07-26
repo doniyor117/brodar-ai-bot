@@ -1,10 +1,43 @@
 import asyncio
 import logging
+import re
 import asyncpg
 from typing import List, Dict, Any, Optional
 import config
 
 logger = logging.getLogger(__name__)
+
+# Cyrillic -> Latin transliteration, covering both Russian and the
+# Uzbek-specific letters (ў, қ, ғ, ҳ). This is what lets a Latin-typed query
+# find a Cyrillic-stored name and vice versa — the normal case in these chats,
+# where the same person's Telegram display name might read "Aziz Karimov" or
+# "Азиз Каримов" depending on which keyboard their phone was using that day.
+_CYRILLIC_TO_LATIN = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+    "ж": "j", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "x", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sh",
+    "ъ": "", "ы": "i", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    "ў": "u", "қ": "q", "ғ": "g", "ҳ": "h",
+}
+_NON_SEARCH_CHARS_RE = re.compile(r"[^a-z0-9\s]")
+_MULTI_SPACE_RE = re.compile(r"\s+")
+
+
+def fold_name(s: str) -> str:
+    """
+    Normalize a name/username for matching: lowercase, transliterate Cyrillic
+    to Latin, strip everything but letters/digits/spaces.
+
+    Used both when writing `search_key` on upsert and when folding an incoming
+    query, so the two sides always compare in the same alphabet regardless of
+    which script the source text used.
+    """
+    if not s:
+        return ""
+    folded = "".join(_CYRILLIC_TO_LATIN.get(ch, ch) for ch in s.lower())
+    folded = _NON_SEARCH_CHARS_RE.sub(" ", folded)
+    return _MULTI_SPACE_RE.sub(" ", folded).strip()
 
 # Connection pool instance
 _pool: Optional[asyncpg.Pool] = None
@@ -61,6 +94,25 @@ SCHEMA_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members (user_id)",
     "CREATE INDEX IF NOT EXISTS idx_chat_members_username ON chat_members (lower(username))",
+    # Folded (lowercase, Cyrillic->Latin, punctuation-stripped) "full_name
+    # username", written by upsert_chat_member and matched token-wise by
+    # search_chat_members. left_at marks someone as gone without deleting their
+    # row, so a search for someone who left last week still resolves instead of
+    # just vanishing. is_admin is a best-effort cache of the last live check —
+    # group_tools.list_admins() is the authoritative source and refreshes it.
+    "ALTER TABLE chat_members ADD COLUMN IF NOT EXISTS search_key TEXT",
+    "ALTER TABLE chat_members ADD COLUMN IF NOT EXISTS left_at TIMESTAMP",
+    "ALTER TABLE chat_members ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_chat_members_search_key ON chat_members (search_key)",
+    # One-time ASCII-only backfill for rows written before search_key existed.
+    # Real Cyrillic folding needs Python, so this only ever fills NULLs — every
+    # live upsert_chat_member call afterwards recomputes the real thing.
+    """
+    UPDATE chat_members SET search_key = lower(regexp_replace(
+        COALESCE(full_name, '') || ' ' || COALESCE(username, ''),
+        '[^a-zA-Z0-9 ]', ' ', 'g'
+    )) WHERE search_key IS NULL
+    """,
     """
     CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -393,21 +445,55 @@ async def prune_recent_visuals(chat_id: int, min_turn: int) -> None:
 async def upsert_chat_member(
     chat_id: int, user_id: int, username: Optional[str],
     full_name: Optional[str], is_bot: bool = False,
+    is_admin: Optional[bool] = None,
 ) -> None:
-    """Record (or refresh) one person's presence in a chat."""
+    """
+    Record (or refresh) one person's presence in a chat.
+
+    `is_admin=None` means "unknown/don't change" — a message from a regular
+    member shouldn't silently overwrite what a live getChatAdministrators call
+    established. Pass True/False explicitly from a source that actually knows
+    (a chat_member update, or group_tools.list_admins()).
+
+    Rejoining clears left_at; search_key is recomputed from whatever the row's
+    username/full_name end up being after the COALESCE, in a second statement,
+    since the transliteration fold itself has to happen in Python.
+    """
     pool = get_pool()
     async with pool.acquire(timeout=config.DB_ACQUIRE_TIMEOUT) as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             """
-            INSERT INTO chat_members (chat_id, user_id, username, full_name, is_bot, last_seen)
-            VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+            INSERT INTO chat_members (chat_id, user_id, username, full_name, is_bot, is_admin, last_seen, left_at)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, FALSE), CURRENT_TIMESTAMP, NULL)
             ON CONFLICT (chat_id, user_id) DO UPDATE SET
                 username  = COALESCE(EXCLUDED.username, chat_members.username),
                 full_name = COALESCE(EXCLUDED.full_name, chat_members.full_name),
                 is_bot    = EXCLUDED.is_bot,
-                last_seen = CURRENT_TIMESTAMP
+                is_admin  = COALESCE($6, chat_members.is_admin),
+                last_seen = CURRENT_TIMESTAMP,
+                left_at   = NULL
+            RETURNING username, full_name
             """,
-            chat_id, user_id, username, full_name, is_bot,
+            chat_id, user_id, username, full_name, is_bot, is_admin,
+        )
+        search_key = fold_name(f"{row['full_name'] or ''} {row['username'] or ''}")
+        await conn.execute(
+            "UPDATE chat_members SET search_key = $1 WHERE chat_id = $2 AND user_id = $3",
+            search_key, chat_id, user_id,
+        )
+
+
+async def mark_member_left(chat_id: int, user_id: int) -> None:
+    """
+    Marks someone as gone from a chat without deleting their row, so a search
+    for them still resolves ("aziz left last week, but here's his id") instead
+    of them just vanishing the moment they leave.
+    """
+    pool = get_pool()
+    async with pool.acquire(timeout=config.DB_ACQUIRE_TIMEOUT) as conn:
+        await conn.execute(
+            "UPDATE chat_members SET left_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND user_id = $2",
+            chat_id, user_id,
         )
 
 
@@ -415,41 +501,73 @@ async def search_chat_members(
     chat_id: Optional[int], query: str, limit: int = 25,
 ) -> List[Dict[str, Any]]:
     """
-    Find members by username, display name, or user id.
+    Find members by username, display name, or user id — token-wise and
+    script-folded.
 
-    Returns structured rows — real chat_id and user_id fields, not a prose
-    string the model has to regex an id back out of.
+    A single whole-phrase `LIKE '%…%'` (the old behaviour) missed "Karimov
+    Aziz" when asked for "aziz karimov", and a Latin-typed query never matched
+    a Cyrillic-stored name at all. Here the query is split into tokens and each
+    is matched independently against the folded search_key, then results are
+    ranked in Python: exact match > prefix match > token-hit count > recency.
+    Only current members (left_at IS NULL) are returned — see mark_member_left.
     """
     pool = get_pool()
-    q = (query or "").strip().lstrip("@").lower()
+    q_raw = (query or "").strip().lstrip("@")
+    q_folded = fold_name(q_raw)
+    tokens = [t for t in q_folded.split(" ") if t]
+    id_query = bool(q_raw) and q_raw.lstrip("-").isdigit()
 
-    conditions, params = [], []
+    conditions, params = ["left_at IS NULL"], []
     if chat_id is not None:
         params.append(chat_id)
         conditions.append(f"chat_id = ${len(params)}")
-    if q:
-        params.append(f"%{q}%")
-        idx = len(params)
-        clause = f"(lower(username) LIKE ${idx} OR lower(full_name) LIKE ${idx}"
-        if q.lstrip("-").isdigit():
-            params.append(int(q))
-            clause += f" OR user_id = ${len(params)}"
-        conditions.append(clause + ")")
 
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    params.append(limit)
+    match_clauses = []
+    for tok in tokens:
+        params.append(f"%{tok}%")
+        match_clauses.append(f"search_key LIKE ${len(params)}")
+    if id_query:
+        params.append(int(q_raw))
+        match_clauses.append(f"user_id = ${len(params)}")
+    if match_clauses:
+        conditions.append("(" + " OR ".join(match_clauses) + ")")
+
+    where = "WHERE " + " AND ".join(conditions)
 
     async with pool.acquire(timeout=config.DB_ACQUIRE_TIMEOUT) as conn:
         rows = await conn.fetch(
             f"""
-            SELECT chat_id, user_id, username, full_name, is_bot, last_seen
+            SELECT chat_id, user_id, username, full_name, is_bot, is_admin, last_seen
             FROM chat_members {where}
             ORDER BY last_seen DESC
-            LIMIT ${len(params)}
+            LIMIT 500
             """,
             *params,
         )
-        return [dict(r) for r in rows]
+
+    candidates = [dict(r) for r in rows]
+    if not tokens:
+        return candidates[:limit]
+
+    candidates.sort(key=lambda row: _member_match_score(row, q_folded, tokens), reverse=True)
+    return candidates[:limit]
+
+
+def _member_match_score(row: Dict[str, Any], q_folded: str, tokens: List[str]) -> tuple:
+    """
+    Rank one candidate row against a folded query: exact match > prefix match >
+    number of tokens that hit > (recency is preserved for free by the stable
+    sort, since rows arrive ORDER BY last_seen DESC).
+
+    Pulled out of search_chat_members as its own function so it's directly
+    unit-testable without a database connection.
+    """
+    uname = fold_name(row.get("username") or "")
+    fname = fold_name(row.get("full_name") or "")
+    exact = 1 if (uname == q_folded or fname == q_folded) else 0
+    prefix = 1 if (uname.startswith(q_folded) or fname.startswith(q_folded)) else 0
+    hits = sum(1 for t in tokens if t in uname or t in fname)
+    return (exact, prefix, hits)
 
 
 async def clear_recent_visuals(chat_id: int) -> None:

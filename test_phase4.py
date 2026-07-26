@@ -152,7 +152,7 @@ def test_member_search_output():
     original = cache.search_users
     cache.search_users = fake_search
     try:
-        out = asyncio.run(agent._run_member_search(-100123, {"query": "bob"}))
+        out = asyncio.run(agent._run_member_search(None, -100123, {"query": "bob"}))
     finally:
         cache.search_users = original
 
@@ -168,7 +168,7 @@ def test_member_search_output():
 
     cache.search_users = no_results
     try:
-        out = asyncio.run(agent._run_member_search(None, {"query": "ghost"}))
+        out = asyncio.run(agent._run_member_search(None, None, {"query": "ghost"}))
     finally:
         cache.search_users = original
 

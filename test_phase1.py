@@ -127,9 +127,16 @@ def test_send_file_sandbox():
 def test_privileged_sets():
     import agent
 
-    for t in ("send_file", "search_group_members", "group_moderation_tool",
+    for t in ("send_file", "group_moderation_tool",
               "edit_env_file", "edit_persona_file", "install_skill_from_url"):
         check(f"'{t}' is privileged", t in agent._PRIVILEGED_TOOLS)
+
+    # search_group_members is deliberately NOT wholesale-privileged since Phase
+    # 8 — a scoped, non-empty search is open to everyone; the empty-query /
+    # cross-chat cases are gated inline at the call site instead. See
+    # test_phase8.py for that split.
+    check("search_group_members is not wholesale-privileged (gated inline instead)",
+          "search_group_members" not in agent._PRIVILEGED_TOOLS)
 
     check("moderation needs no approval tap (an admin already asked for it)",
           "group_moderation_tool" not in agent._APPROVAL_REQUIRED_TOOLS)

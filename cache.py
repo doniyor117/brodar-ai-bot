@@ -34,13 +34,19 @@ _MEMBER_CACHE_CHAT_LIMIT = 200
 
 
 def track_user(chat_id: int, user_id: int, name: str,
-               username: Optional[str] = None, is_bot: bool = False) -> None:
+               username: Optional[str] = None, is_bot: bool = False,
+               is_admin: Optional[bool] = None) -> None:
     """
     Record that a user was seen in a chat, in memory and in Postgres.
 
     Called from every incoming message — including commands and DMs, which the
     old call site skipped, so anyone who only ever sent commands was invisible
     to the lookup tool.
+
+    `is_admin=None` (the default, used by ordinary message tracking) leaves
+    the stored admin flag untouched — only a chat_member update or a live
+    group_tools.list_admins() call actually knows admin status and should be
+    allowed to change it.
     """
     if not chat_id or not user_id:
         return
@@ -51,6 +57,7 @@ def track_user(chat_id: int, user_id: int, name: str,
         "username": username or existing.get("username"),
         "full_name": name or existing.get("full_name"),
         "is_bot": is_bot,
+        "is_admin": is_admin if is_admin is not None else existing.get("is_admin", False),
     }
     chat[user_id] = record
 
@@ -59,7 +66,16 @@ def track_user(chat_id: int, user_id: int, name: str,
 
     _spawn_db_write(db.upsert_chat_member(
         chat_id, user_id, record["username"], record["full_name"], is_bot,
+        is_admin=is_admin,
     ))
+
+
+def mark_member_left(chat_id: int, user_id: int) -> None:
+    """Fire-and-forget: mark someone as gone from a chat (see db.mark_member_left)."""
+    if not chat_id or not user_id:
+        return
+    _member_cache.get(chat_id, {}).pop(user_id, None)
+    _spawn_db_write(db.mark_member_left(chat_id, user_id))
 
 
 async def search_users(chat_id: Optional[int] = None, query: str = "",
@@ -93,6 +109,7 @@ async def search_users(chat_id: Optional[int] = None, query: str = "",
                     "username": rec.get("username"),
                     "full_name": rec.get("full_name"),
                     "is_bot": rec.get("is_bot", False),
+                    "is_admin": rec.get("is_admin", False),
                 })
     return out[:limit]
 _write_tasks: set = set()

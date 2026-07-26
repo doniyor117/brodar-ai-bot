@@ -32,7 +32,7 @@ This skill provides you with a comprehensive map of your own source code, explai
 - **Role**: Temporarily holds data that must be fast and transient.
 - **Key Features**:
   - `_history_cache`: A `deque` of recent messages per chat.
-  - `_member_cache`: a write-through mirror of the `chat_members` Postgres table, populated from every incoming message (commands and DMs included). The DATABASE is the source of truth, so member lookup survives a restart — `search_group_members` queries it and returns structured `user_id` / `chat_id` fields.
+  - `_member_cache`: a write-through mirror of the `chat_members` Postgres table. Populated from every incoming message (commands and DMs included), AND from `chat_member` updates (joins/leaves/promotions — delivered independent of whether the person ever spoke), AND live on demand from `getChatAdministrators` whenever `search_group_members` is scoped to a chat. The DATABASE is the source of truth, so member lookup survives a restart. See the `telegram-directory` skill for what this can and can't answer.
   - Visual memory tracking (managing how long images stay in context).
 
 ### `db.py` (The Persistence Layer)

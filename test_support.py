@@ -98,6 +98,9 @@ def _stub_aiogram():
             self.message = _Observer()
             self.callback_query = _Observer()
             self.edited_message = _Observer()
+            self.chat_member = _Observer()
+            self.my_chat_member = _Observer()
+            self.chat_join_request = _Observer()
 
         def include_router(self, *a, **k): ...
 
@@ -132,7 +135,8 @@ def _stub_aiogram():
         "ReactionTypeEmoji", "FSInputFile", "BotCommand",
         "BotCommandScopeAllPrivateChats", "BotCommandScopeAllGroupChats",
         "BotCommandScopeAllChatAdministrators", "ChatPermissions",
-        "InputRichMessage", "Update",
+        "InputRichMessage", "Update", "ChatMemberUpdated", "ChatJoinRequest",
+        "ChatMember",
     ):
         setattr(types_mod, name, type(name, (_Obj,), {}))
 
