@@ -124,6 +124,41 @@ _GROUP_SHOTS = [
 ]
 
 
+# Which skills each chat has already pulled in, so their instructions can be
+# inlined into the system prompt instead of being re-fetched by tool call every
+# turn. Bounded, and cleared by /clear.
+_loaded_skills: Dict[int, List[str]] = {}
+_LOADED_SKILLS_CHAT_LIMIT = 500
+_LOADED_SKILLS_PER_CHAT = 4
+
+
+def note_skill_loaded(chat_id: Optional[int], slug: str) -> None:
+    """Remember that this chat has loaded a skill."""
+    if not chat_id or not slug:
+        return
+    loaded = _loaded_skills.setdefault(chat_id, [])
+    if slug in loaded:
+        loaded.remove(slug)
+    loaded.append(slug)
+    # Keep only the most recent few: their full text goes into every subsequent
+    # system prompt, so this is a direct token cost.
+    del loaded[:-_LOADED_SKILLS_PER_CHAT]
+
+    if len(_loaded_skills) > _LOADED_SKILLS_CHAT_LIMIT:
+        _loaded_skills.pop(next(iter(_loaded_skills)), None)
+
+
+def get_loaded_skills(chat_id: Optional[int]) -> List[str]:
+    """Skills already loaded in this chat, oldest first."""
+    return list(_loaded_skills.get(chat_id, [])) if chat_id else []
+
+
+def clear_loaded_skills(chat_id: Optional[int]) -> None:
+    """Forget this chat's loaded skills (used by /clear)."""
+    if chat_id:
+        _loaded_skills.pop(chat_id, None)
+
+
 def few_shots_for(is_group: bool) -> List[Dict[str, str]]:
     """The few-shot block for this chat type. [SILENT] never leaks into a DM."""
     shots = list(_VOICE_SHOTS) + list(_OBEDIENCE_SHOTS)
@@ -132,8 +167,15 @@ def few_shots_for(is_group: bool) -> List[Dict[str, str]]:
     return shots
 
 async def cancel_running_task(chat_id: int) -> bool:
-    """Cancels all active LLM generation / tool loop tasks for a chat_id."""
-    tasks = _running_tasks.get(chat_id)
+    """
+    Cancels all active LLM generation / tool loop tasks for a chat_id.
+
+    The set is detached from the registry BEFORE anything is cancelled. It used
+    to be popped afterwards, so a task registered while the loop was cancelling
+    landed in a set that was then thrown away — leaving it running with no way
+    to ever reach it again, and /stop reporting success.
+    """
+    tasks = _running_tasks.pop(chat_id, None)
     if not tasks:
         return False
     cancelled_any = False
@@ -141,18 +183,18 @@ async def cancel_running_task(chat_id: int) -> bool:
         if not task.done():
             task.cancel()
             cancelled_any = True
-    _running_tasks.pop(chat_id, None)
     return cancelled_any
 
 async def cancel_all_tasks() -> int:
     """Cancels all active agent tasks running across all chats globally."""
+    snapshot = list(_running_tasks.items())
+    _running_tasks.clear()
     count = 0
-    for chat_id, tasks in list(_running_tasks.items()):
+    for _chat_id, tasks in snapshot:
         for task in list(tasks):
             if not task.done():
                 task.cancel()
                 count += 1
-    _running_tasks.clear()
     return count
 
 def count_tokens(messages: List[Dict[str, Any]], model: Optional[str] = None) -> int:
@@ -785,11 +827,12 @@ def split_persona(persona: str) -> tuple:
 def build_system_prompt(
     persona: str,
     learned_facts: str,
-    avail_skills: List[str],
+    avail_skills: List[Dict[str, Any]],
     date_line: str,
     summary_text: str = "",
     is_group: bool = False,
     requester_is_privileged: bool = False,
+    loaded_skills: Optional[List[str]] = None,
 ) -> str:
     """
     Compose the system prompt from ordered, non-contradictory blocks.
@@ -825,7 +868,12 @@ def build_system_prompt(
     if learned_facts.strip():
         blocks.append(f"# Learned Facts\n{learned_facts.strip()}")
 
-    blocks.append(_skills_block(avail_skills))
+    loaded_skills = loaded_skills or []
+    blocks.append(_skills_block(avail_skills, loaded_skills))
+
+    loaded_block = _loaded_skills_block(loaded_skills)
+    if loaded_block:
+        blocks.append(loaded_block)
 
     if is_group:
         chat_mode = (
@@ -878,20 +926,56 @@ def build_system_prompt(
     return "\n\n".join(b for b in blocks if b and b.strip())
 
 
-def _skills_block(avail_skills: List[str]) -> str:
-    """The available-skills section of the system prompt."""
+def _skills_block(avail_skills: List[Dict[str, Any]], loaded: Optional[List[str]] = None) -> str:
+    """
+    The available-skills section of the system prompt.
+
+    Skills are listed with their one-line descriptions — they were previously
+    advertised as bare names, leaving the model to guess what each one was for.
+    """
     if not avail_skills:
-        return (
-            "# Available Skills\n"
-            "(none installed right now — don't call `use_skill`.)"
-        )
-    return (
-        "# Available Skills\n"
-        + "\n".join(f"- {name}" for name in avail_skills)
-        + "\nwhen a task matches one of these and you haven't read its instructions yet "
-          "in this conversation, call `use_skill` first instead of guessing. once you've "
-          "read a skill, don't call `use_skill` for it again."
+        return "# Available Skills\n(none installed right now — don't call `use_skill`.)"
+
+    lines = []
+    for s in avail_skills:
+        slug = s["slug"] if isinstance(s, dict) else str(s)
+        desc = s.get("description", "") if isinstance(s, dict) else ""
+        lines.append(f"- `{slug}` — {desc}" if desc else f"- `{slug}`")
+
+    block = (
+        "# Available Skills\n" + "\n".join(lines) +
+        "\ncall `use_skill` with the name in backticks when a task matches one and its "
+        "instructions aren't already in this prompt."
     )
+
+    if loaded:
+        block += (
+            "\n\nyou have ALREADY loaded: " + ", ".join(f"`{s}`" for s in loaded) +
+            ". their full instructions are included below — do NOT call `use_skill` "
+            "for those again."
+        )
+    return block
+
+
+def _loaded_skills_block(loaded: List[str]) -> str:
+    """
+    Inline the instruction text of skills already loaded in this chat.
+
+    The previous "stop re-reading skills" fix only added a prompt line saying
+    "if you already read it in the chat history, don't call use_skill again" —
+    but tool messages are never persisted (bot.py saves the user and assistant
+    turns only), so that precondition could never be true and the model
+    re-fetched every skill on every single turn. Putting the actual content in
+    the prompt makes the tool call genuinely unnecessary.
+    """
+    sections = []
+    for slug in loaded:
+        body = skills.get_skill_body(slug)
+        if body:
+            sections.append(f"## Skill: {slug}\n{body}")
+    if not sections:
+        return ""
+    return "# Loaded Skill Instructions\n" + "\n\n".join(sections)
 
 
 async def generate_response(
@@ -933,7 +1017,7 @@ async def generate_response(
     # Persona (fixed, code-owned) + learned facts (mutable) + skills.
     persona = memory.read_persona()
     learned_facts = memory.read_memory_md()
-    avail_skills = [s["name"] for s in skills.list_available_skills()]
+    avail_skills = skills.list_available_skills()
 
     # The model's training data ends years ago, so without this it searches for
     # the wrong year and misjudges "current" events. Inject the real date.
@@ -953,6 +1037,7 @@ async def generate_response(
         persona=persona,
         learned_facts=learned_facts,
         avail_skills=avail_skills,
+        loaded_skills=get_loaded_skills(chat_id),
         date_line=date_line,
         summary_text=summary_text,
         is_group=is_group,
@@ -1085,6 +1170,11 @@ async def generate_response(
             elif tool_name == "use_skill":
                 skill_name = args.get("skill_name", "")
                 tool_result = skills.load_skill_instruction(skill_name)
+                # Remember it so the next turn gets the text in its system
+                # prompt and doesn't need to fetch it again.
+                resolved = skills._resolve_slug(skill_name)
+                if resolved and skills.is_skill_enabled(resolved):
+                    note_skill_loaded(chat_id, resolved)
             elif tool_name == "save_memory_fact":
                 fact = args.get("fact", "")
                 success = memory.append_user_fact(fact)

@@ -263,12 +263,23 @@ def read_code(path: str) -> str:
         tokenize.ENCODING, tokenize.INDENT, tokenize.DEDENT,
         tokenize.NEWLINE, tokenize.NL,
     }
+    openers, closers = {"(", "[", "{"}, {")", "]", "}"}
 
     out, prev_end, prev_type = [], (1, 0), tokenize.ENCODING
+    depth = 0
     for tok in tokens:
         if tok.type in (tokenize.COMMENT, tokenize.ENCODING):
             continue
-        if tok.type == tokenize.STRING and prev_type in statement_start:
+        if tok.type == tokenize.OP:
+            if tok.string in openers:
+                depth += 1
+            elif tok.string in closers:
+                depth = max(0, depth - 1)
+        # Inside brackets, a line break emits NL, so every string literal in a
+        # multi-line list looked statement-initial and was dropped as a
+        # docstring — silently deleting things like the secrets_to_strip list
+        # that assertions then "proved" were absent.
+        if tok.type == tokenize.STRING and prev_type in statement_start and depth == 0:
             prev_type = tokenize.NEWLINE  # a docstring ends its own statement
             prev_end = tok.end
             continue

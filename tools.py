@@ -4,6 +4,7 @@ import shlex
 import shutil
 import subprocess
 import logging
+from collections import OrderedDict
 from typing import List, Dict, Any
 
 import config
@@ -128,30 +129,35 @@ def _workspace_dir() -> str:
     return d
 
 
-def is_env_access_attempt(command: str, args_str: str) -> bool:
+def _path_args_are_safe(args_list: List[str], workspace: str, cwd: str = None) -> bool:
     """
-    Kept for backwards compatibility. The real protection is the workspace
-    sandbox in execute_shell_command; this is now just a fast obvious-case check.
-    """
-    text = f"{command} {args_str}".lower()
-    return ".env" in text or "env." in text or "/env" in text
+    Ensure every filesystem-path argument resolves inside the workspace sandbox.
+    This is what stops `grep -ri API .`, `cat ../.env`, absolute paths and
+    symlink tricks from ever reaching the secrets on disk.
 
+    `cwd` is the session's *current* directory, which is what the command will
+    actually run in. Relative paths were previously resolved against the
+    workspace ROOT while the command executed in the session cwd — so after a
+    `cd sub`, `cat notes.txt` was validated against the wrong file entirely, and
+    `cd ..` could never be accepted no matter how deep you were.
 
-def _path_args_are_safe(args_list: List[str], workspace: str) -> bool:
-    """
-    Ensures every filesystem-path argument resolves to a location *inside* the
-    workspace sandbox. This is what stops `grep -ri API .`, `cat ../.env`,
-    absolute paths, and symlink tricks from ever reaching the secrets on disk.
+    Containment is still checked against the workspace root, so a path can never
+    escape the sandbox regardless of where the session currently is.
     """
     real_workspace = os.path.realpath(workspace)
+    base = os.path.realpath(cwd) if cwd else real_workspace
+
+    # A cwd outside the sandbox would be a bug elsewhere; refuse rather than
+    # widen the sandbox to wherever it points.
+    if base != real_workspace and not base.startswith(real_workspace + os.sep):
+        logger.error(f"Session cwd {base!r} is outside the workspace; refusing.")
+        return False
+
     for arg in args_list:
         # Skip flags and grep/find operators — only inspect things that look like paths.
         if arg.startswith("-") or arg == "-name":
             continue
-        # A bare grep pattern (no slash, no dot-path) isn't a path; leave it.
-        candidate = arg
-        # Resolve relative to the workspace, following symlinks.
-        resolved = os.path.realpath(os.path.join(real_workspace, candidate))
+        resolved = os.path.realpath(os.path.join(base, arg))
         if resolved != real_workspace and not resolved.startswith(real_workspace + os.sep):
             logger.warning(f"Blocked shell tool path escaping workspace: {arg!r} -> {resolved}")
             return False
@@ -222,8 +228,10 @@ def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
         except ImportError:
             logger.warning("EXA_API_KEY is set but exa_py package is missing. Falling back to DuckDuckGo.")
         except Exception as e:
-            logger.error(f"Exa search error: {e}")
-            return [{"error": f"Exa search failed: {str(e)}"}]
+            # Fall through to DuckDuckGo. This used to return the error, so a
+            # single bad Exa key or a transient Exa outage disabled web search
+            # entirely — despite the docstring promising a fallback.
+            logger.error(f"Exa search error, falling back to DuckDuckGo: {e}")
 
     if DDGS is None:
         return [{"error": "DuckDuckGo search package is not installed/available."}]
@@ -245,7 +253,25 @@ def search_web(query: str, max_results: int = 5) -> List[Dict[str, str]]:
         logger.error(f"DuckDuckGo search error: {e}", exc_info=True)
         return [{"error": f"Search failed: {str(e)}"}]
 
-_terminal_sessions = {}
+# Per-chat persistent shell cwd. Bounded: this grew forever, one entry per chat
+# that ever ran a shell command, and nothing ever removed one.
+_terminal_sessions: "OrderedDict[str, str]" = OrderedDict()
+MAX_TERMINAL_SESSIONS = 200
+
+
+def _touch_session(chat_id: str, cwd: str) -> None:
+    """Record a session's cwd, evicting the least recently used when full."""
+    _terminal_sessions[chat_id] = cwd
+    _terminal_sessions.move_to_end(chat_id)
+    while len(_terminal_sessions) > MAX_TERMINAL_SESSIONS:
+        evicted, _ = _terminal_sessions.popitem(last=False)
+        logger.debug(f"Evicted stale terminal session for chat {evicted}.")
+
+
+def reset_session(chat_id: str) -> None:
+    """Drop a chat's shell cwd, so /clear really does start clean."""
+    _terminal_sessions.pop(str(chat_id), None)
+
 
 def execute_shell_command(command: str, args_str: str = "", chat_id: str = "default") -> str:
     """
@@ -283,16 +309,22 @@ def execute_shell_command(command: str, args_str: str = "", chat_id: str = "defa
     # 5. Confine filesystem commands to the sandbox workspace.
     # This is the core defense: .env and the source tree live OUTSIDE this dir,
     # so no combination of cat/grep/head/tail/find/ls can read secrets.
-    base_workspace = _workspace_dir()
-    
-    current_cwd = _terminal_sessions.get(chat_id, base_workspace)
-    if not os.path.exists(current_cwd):
+    # realpath, because every containment check below compares against it and
+    # the configured path may be a symlink or contain "..".
+    base_workspace = os.path.realpath(_workspace_dir())
+    session_key = str(chat_id)
+
+    current_cwd = _terminal_sessions.get(session_key, base_workspace)
+    if not os.path.isdir(current_cwd):
         current_cwd = base_workspace
-        _terminal_sessions[chat_id] = current_cwd
-        
+    _touch_session(session_key, current_cwd)
+
+
     if cmd_config.get("has_path_args"):
-        # validate paths against base_workspace so they can't escape
-        if not _path_args_are_safe(args_list, base_workspace):
+        # Relative paths must be resolved from where the command will ACTUALLY run
+        # (the session cwd), not from the workspace root. Containment is still
+        # checked against the root inside _path_args_are_safe, so nothing escapes.
+        if not _path_args_are_safe(args_list, base_workspace, cwd=current_cwd):
             return "Error: Path arguments must stay inside the sandbox workspace. Access denied."
 
     # Handle cd built-in
@@ -305,14 +337,19 @@ def execute_shell_command(command: str, args_str: str = "", chat_id: str = "defa
             return "Error: Cannot cd outside of sandbox workspace."
         if not os.path.isdir(new_cwd):
             return f"Error: '{target}' is not a directory."
-        _terminal_sessions[chat_id] = new_cwd
+        _touch_session(session_key, new_cwd)
         return f"Changed directory to {new_cwd.replace(base_workspace, '~')}"
 
     # 6. Sanitize environment (remove secrets)
     env = os.environ.copy()
+    # Every credential the process holds, not a subset. GEMINI_API_KEY and
+    # EXA_API_KEY were both missing here, so `env`-adjacent output or a child
+    # process that dumps its environment leaked them.
     secrets_to_strip = [
         "TELEGRAM_BOT_TOKEN",
         "ZAI_API_KEY",
+        "GEMINI_API_KEY",
+        "EXA_API_KEY",
         "DATABASE_URL",
         "WEBHOOK_SECRET_TOKEN",
     ]

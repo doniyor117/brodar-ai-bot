@@ -18,6 +18,7 @@ import config
 import cache
 import agent
 import models
+import tools
 
 logger = logging.getLogger(__name__)
 
@@ -537,34 +538,6 @@ _PROTECTED_SPAN_RE = _re.compile(
     _re.DOTALL,
 )
 
-# Matches a protected region whose internal newlines must stay bare in the
-# rich-message path: a fenced code block (```...```) OR a GFM pipe-table block
-# (a header row, a delimiter row of dashes/pipes, then any pipe data rows).
-_RICH_PROTECTED_REGION_RE = _re.compile(
-    r'(?:```[^\n]*\n[\s\S]*?```)'                       # fenced code block
-    r'|(?:^[^\n]*\|[^\n]*\n'                            # table header row (has a pipe)
-    r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
-    r'(?:\n[^\n]*\|[^\n]*)*)',                          # data rows
-    _re.MULTILINE,
-)
-
-def _rich_normalize_linebreaks(text: str) -> str:
-    """Convert single `\\n` to Markdown hard breaks for the rich-message path."""
-    if not text or '\n' not in text:
-        return text
-
-    out: list[str] = []
-    pos = 0
-    for m in _RICH_PROTECTED_REGION_RE.finditer(text):
-        prose = text[pos:m.start()]
-        out.append(_re.sub(r'(?<!\n)\n(?!\n)', '  \n', prose))
-        out.append(m.group(0))  # protected region kept verbatim
-        pos = m.end()
-    tail = text[pos:]
-    out.append(_re.sub(r'(?<!\n)\n(?!\n)', '  \n', tail))
-    return ''.join(out)
-
-
 
 def enforce_lowercase(text: str) -> str:
     """Lowercases conversational text while preserving URLs and code spans."""
@@ -583,18 +556,12 @@ async def send_long_reply(message: Message, text: str) -> None:
     """
     if not text:
         text = "..."
-        
-    # Send rich message natively if the bot supports it and the text is not too long
-    # (Telegram API limits InputRichMessage markdown payload to 32768 chars)
-    if hasattr(message.bot, 'send_rich_message') and len(text) < 32768:
-        try:
-            normalized = _rich_normalize_linebreaks(text)
-            rich_msg = InputRichMessage(markdown=normalized)
-            await message.bot.send_rich_message(chat_id=message.chat.id, rich_message=rich_msg)
-            return
-        except Exception as e:
-            # Fallback to standard message chunking if send_rich_message fails
-            logger.warning(f"send_rich_message failed, falling back to standard reply: {e}")
+
+    # There used to be a "rich message" fast path here guarded by
+    # `hasattr(message.bot, 'send_rich_message')`. aiogram 3.x has no such
+    # method, so the guard was always False — which was the only thing hiding a
+    # NameError: `InputRichMessage` was referenced but never imported. Deleted
+    # rather than fixed: chunking below is the real, working path.
 
     # First chunk is a reply; the rest are follow-up sends to keep ordering.
     chunks = [text[i:i + TELEGRAM_MAX_MESSAGE_LEN] for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LEN)]
@@ -849,20 +816,30 @@ async def cmd_clear(message: Message, bot: Bot):
     # only the text meant a "fresh start" immediately re-attached images from
     # before the clear, and the bot kept answering about them.
     await cache.clear_visuals(chat_id)
+    # Skill bodies loaded this session are inlined into the system prompt, and
+    # the shell tool keeps a persistent cwd. Neither is conversation history, but
+    # both are context — leaving them behind made "fresh start" a half-truth.
+    agent.clear_loaded_skills(chat_id)
+    tools.reset_session(chat_id)
     await message.reply("cleared conversation context for this chat. fresh start.")
 
 @router.message(Command("skills"))
-async def cmd_skills(message: Message):
-    """Lists available skill instructions."""
+async def cmd_skills(message: Message, bot: Bot):
+    """Lists available skill instructions. Admin-only: skills describe internals."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can list skills.")
+        return
     import skills
     avail = skills.list_available_skills()
     if not avail:
         await message.reply("no skills found in skills/ directory.")
         return
-        
+
+    # The slug is the name every other command accepts. Listing the display name
+    # here is what made `/disable_skill "Brodar Bot Architecture"` report "not found".
     lines = ["available skill instructions:"]
     for s in avail:
-        lines.append(f"- {s['name']}: {s['description']}")
+        lines.append(f"- {s['slug']}: {s['description']}")
     lines.append("\nuse tool calls or ask me to perform any of these skills.")
     await message.reply("\n".join(lines))
 
@@ -881,8 +858,11 @@ async def cmd_memory(message: Message, bot: Bot):
 
 @router.message(Command("stop"))
 @router.message(Command("cancel"))
-async def cmd_stop(message: Message):
-    """Emergency Abort / Kill Switch handler."""
+async def cmd_stop(message: Message, bot: Bot):
+    """Emergency Abort / Kill Switch handler. Gated: it cancels other people's turns."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can halt running tasks.")
+        return
     chat_id = message.chat.id
     cancelled = await agent.cancel_running_task(chat_id)
     if cancelled:
@@ -905,8 +885,11 @@ async def cmd_new_session(message: Message, bot: Bot):
     await message.reply(f"started new session '{session.get('title')}' (id: {session.get('id')}). fresh memory.")
 
 @router.message(Command("sessions"))
-async def cmd_sessions(message: Message):
-    """Lists all sessions for the chat."""
+async def cmd_sessions(message: Message, bot: Bot):
+    """Lists all sessions for the chat. Gated: session titles leak conversation topics."""
+    if not await is_user_privileged(message, bot):
+        await message.reply("only authorized admins can list sessions.")
+        return
     chat_id = message.chat.id
     import session_manager
     sessions = await session_manager.list_sessions(chat_id)
