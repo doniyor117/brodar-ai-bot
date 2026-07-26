@@ -729,24 +729,64 @@ async def cmd_start(message: Message):
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    """Help command handler. Casual description of commands."""
-    text = (
-        "here is what you can do with me:\n"
-        "- talk normally: type text, send images/video/voice, or forward messages (i'll wait a few seconds if you want to type a follow-up command).\n"
-        "- /status: view bot status, system uptime, and settings.\n"
-        "- /clear: reset chat context and history.\n"
-        "- /skills: list available skill instructions.\n"
-        "- /memory: view stored persistent facts from memory.md.\n"
-        "- /activate (authorized users): enable bot in group.\n"
-        "- /deactivate (authorized users): disable bot in group.\n"
-        "- /allow_user <id> (authorized users): grant DM access to a user.\n"
-        "- /disallow_user <id> (authorized users): revoke DM access.\n"
-        "- /set_main_account (authorized users): set this current account as the main master account.\n"
-        "- /toggle_reply (group admins): toggle mention-only vs reply-all mode.\n"
-        "- /toggle_tools (admins): show or hide the tool-activity clues.\n"
-        "- /model (admins): switch the ai model (some can see images)."
-    )
-    await message.reply(text)
+    """
+    Help command handler. Casual description of commands.
+
+    Grouped by who can use them, and complete against KNOWN_COMMANDS (see the
+    test that checks this file against the actual registered handlers) —
+    this used to list barely a third of the real commands, so most of what
+    the bot could do was invisible unless someone already knew to ask.
+    """
+    is_group = message.chat.type != "private"
+
+    lines = [
+        "here is what you can do with me:",
+        "- talk normally: type text, send images/video/voice, or forward messages "
+        "(i'll wait a few seconds if you want to type a follow-up command).",
+        "",
+        "session & memory:",
+        "- /status: bot status, uptime, settings, where approvals go.",
+        "- /clear: reset chat context and history.",
+        "- /new (or /new_session): start a fresh session.",
+        "- /sessions: list this chat's sessions.",
+        "- /switch_session <id>: switch to a different one.",
+        "- /compress (or /compact): summarize older context into a checkpoint.",
+        "- /stop (or /cancel): halt whatever i'm currently doing in this chat.",
+        "- /skills: list available skill instructions.",
+        "- /memory: view stored persistent facts.",
+    ]
+
+    if is_group:
+        lines += [
+            "",
+            "group admin:",
+            "- /activate / /deactivate: turn me on/off in this group.",
+            "- /toggle_reply: mention-only vs reply-to-everything mode.",
+            "- /ban <user_id> [duration_seconds] (needs an approval tap — see /status): remove someone.",
+            "- /unban <user_id> (needs approval): reverse a ban.",
+            "- /mute <user_id> [duration_seconds] (needs approval): restrict without removing.",
+            "- /unmute <user_id>: reverse a mute.",
+            "- /promote <user_id> [title] (needs approval): make them an admin.",
+            "- /demote <user_id> (needs approval): remove admin status.",
+            "- /set_title <text>: change the group's title.",
+            "- or just ask in plain words — \"mute @someone for 10 min\" works the same "
+            "way and covers a lot more (permissions, invite links, join requests, "
+            "forum topics, ...); i'll look them up first if i don't have their id.",
+        ]
+
+    lines += [
+        "",
+        "admin-only (dm or global):",
+        "- /allow_user <id> / /disallow_user <id>: grant/revoke dm access.",
+        "- /set_main_account: make this account the one approvals go to.",
+        "- /toggle_tools: show or hide the tool-activity clues.",
+        "- /model: switch the ai model (some see images/hear audio, some don't).",
+        "- /install_skill <url> / /enable_skill <name> / /disable_skill <name> / "
+        "/uninstall_skill <name>: manage skills.",
+        "- /stop_all (or /cancel_all): emergency-stop every active task, everywhere.",
+    ]
+
+    await message.reply("\n".join(lines))
 
 @router.message(Command("toggle_reply"))
 async def cmd_toggle_reply(message: Message, bot: Bot):
@@ -1114,9 +1154,39 @@ async def cmd_uninstall_skill(message: Message, bot: Bot):
     result = skills.uninstall_skill(skill_name)
     await message.reply(result)
 
+def _requester_and_chat_ctx(message: Message) -> tuple:
+    """
+    (requester, chat_info) dicts for the approval card's provenance fields —
+    who's actually asking and where, as opposed to `privileged` which is
+    about authority, not identity. Shared by the main chat handler and every
+    slash-command moderation path so both build the exact same card.
+    """
+    requester_ctx = None
+    if message.from_user:
+        requester_ctx = {
+            "user_id": message.from_user.id,
+            "username": message.from_user.username,
+            "full_name": message.from_user.full_name,
+            "message_id": message.message_id,
+        }
+    chat_ctx = {
+        "id": message.chat.id,
+        "title": getattr(message.chat, "title", None),
+        "type": message.chat.type,
+    }
+    return requester_ctx, chat_ctx
+
+
 @router.message(Command("ban"))
 async def cmd_ban(message: Message, bot: Bot):
-    """Group admin ban command."""
+    """
+    Group admin ban command.
+
+    Routes through agent.run_moderation_command() rather than calling
+    group_tools directly — kick_ban needs an approval tap (Phase 9) exactly
+    like it would if asked in words, and a slash command must not be a way
+    to skip that.
+    """
     if message.chat.type == "private":
         await message.reply("this command only works in groups.")
         return
@@ -1129,13 +1199,17 @@ async def cmd_ban(message: Message, bot: Bot):
         return
     user_id = int(parts[1])
     duration = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-    import group_tools
-    res = await group_tools.ban_member(bot, message.chat.id, user_id, duration)
+    requester_ctx, chat_ctx = _requester_and_chat_ctx(message)
+    res = await agent.run_moderation_command(
+        bot, message.chat.id, "kick_ban",
+        {"target_user_id": user_id, "duration_seconds": duration},
+        requester_ctx, chat_ctx, message.text or "",
+    )
     await message.reply(res)
 
 @router.message(Command("unban"))
 async def cmd_unban(message: Message, bot: Bot):
-    """Group admin unban command."""
+    """Group admin unban command. See cmd_ban's docstring re: the approval gate."""
     if message.chat.type == "private":
         await message.reply("this command only works in groups.")
         return
@@ -1147,13 +1221,16 @@ async def cmd_unban(message: Message, bot: Bot):
         await message.reply("usage: /unban <user_id>")
         return
     user_id = int(parts[1])
-    import group_tools
-    res = await group_tools.unban_member(bot, message.chat.id, user_id)
+    requester_ctx, chat_ctx = _requester_and_chat_ctx(message)
+    res = await agent.run_moderation_command(
+        bot, message.chat.id, "unban", {"target_user_id": user_id},
+        requester_ctx, chat_ctx, message.text or "",
+    )
     await message.reply(res)
 
 @router.message(Command("mute"))
 async def cmd_mute(message: Message, bot: Bot):
-    """Group admin mute command."""
+    """Group admin mute command. See cmd_ban's docstring re: the approval gate."""
     if message.chat.type == "private":
         await message.reply("this command only works in groups.")
         return
@@ -1166,8 +1243,12 @@ async def cmd_mute(message: Message, bot: Bot):
         return
     user_id = int(parts[1])
     duration = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-    import group_tools
-    res = await group_tools.mute_member(bot, message.chat.id, user_id, duration)
+    requester_ctx, chat_ctx = _requester_and_chat_ctx(message)
+    res = await agent.run_moderation_command(
+        bot, message.chat.id, "mute",
+        {"target_user_id": user_id, "duration_seconds": duration},
+        requester_ctx, chat_ctx, message.text or "",
+    )
     await message.reply(res)
 
 @router.message(Command("unmute"))
@@ -1201,7 +1282,7 @@ async def cmd_stop_all(message: Message):
 
 @router.message(Command("promote"))
 async def cmd_promote(message: Message, bot: Bot):
-    """Group admin promote member to admin."""
+    """Group admin promote member to admin. See cmd_ban's docstring re: the approval gate."""
     if message.chat.type == "private":
         await message.reply("this command only works in groups.")
         return
@@ -1214,13 +1295,17 @@ async def cmd_promote(message: Message, bot: Bot):
         return
     target_uid = int(parts[1])
     title = parts[2] if len(parts) > 2 else "Admin"
-    import group_tools
-    res = await group_tools.promote_to_admin(bot, message.chat.id, target_uid, title)
+    requester_ctx, chat_ctx = _requester_and_chat_ctx(message)
+    res = await agent.run_moderation_command(
+        bot, message.chat.id, "promote_admin",
+        {"target_user_id": target_uid, "text_param": title},
+        requester_ctx, chat_ctx, message.text or "",
+    )
     await message.reply(res)
 
 @router.message(Command("demote"))
 async def cmd_demote(message: Message, bot: Bot):
-    """Group admin demote member from admin."""
+    """Group admin demote member from admin. See cmd_ban's docstring re: the approval gate."""
     if message.chat.type == "private":
         await message.reply("this command only works in groups.")
         return
@@ -1232,8 +1317,11 @@ async def cmd_demote(message: Message, bot: Bot):
         await message.reply("usage: /demote <user_id>")
         return
     target_uid = int(parts[1])
-    import group_tools
-    res = await group_tools.demote_from_admin(bot, message.chat.id, target_uid)
+    requester_ctx, chat_ctx = _requester_and_chat_ctx(message)
+    res = await agent.run_moderation_command(
+        bot, message.chat.id, "demote_admin", {"target_user_id": target_uid},
+        requester_ctx, chat_ctx, message.text or "",
+    )
     await message.reply(res)
 
 @router.message(Command("set_title"))
@@ -1858,22 +1946,7 @@ async def handle_chat_message(message: Message, bot: Bot, album: list = None):
         # this turn or carried over from a recent one.
         turn_mode = response_mode.classify(cleaned_text, has_media or had_prior_media)
 
-        # Who's actually asking, and where — needed for the approval card's
-        # provenance fields (Phase 9). Not the same thing as `privileged`: this
-        # is identity, not authority.
-        requester_ctx = None
-        if message.from_user:
-            requester_ctx = {
-                "user_id": message.from_user.id,
-                "username": message.from_user.username,
-                "full_name": message.from_user.full_name,
-                "message_id": message.message_id,
-            }
-        chat_ctx = {
-            "id": message.chat.id,
-            "title": getattr(message.chat, "title", None),
-            "type": message.chat.type,
-        }
+        requester_ctx, chat_ctx = _requester_and_chat_ctx(message)
 
         async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
             logger.info(f"Generating agent response for chat {chat_id} (mode={turn_mode})...")

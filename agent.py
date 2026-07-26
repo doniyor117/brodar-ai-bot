@@ -1752,6 +1752,34 @@ async def _run_moderation(bot_instance, chat_id: Optional[int], args: Dict[str, 
     )
 
 
+async def run_moderation_command(
+    bot_instance, chat_id: int, action: str, args: Dict[str, Any],
+    requester: Optional[Dict[str, Any]] = None,
+    chat_info: Optional[Dict[str, Any]] = None,
+    trigger_text: str = "",
+) -> str:
+    """
+    Entry point for moderation triggered by a direct slash command (/ban,
+    /mute, /promote, ...) rather than the LLM's own tool-call loop.
+
+    Routes through the IDENTICAL _tool_needs_approval() /
+    _request_interactive_approval() gate group_moderation_tool uses, so a
+    slash command can't be used to bypass the approval requirement the
+    natural-language path enforces — without this, "ban this guy in words"
+    would ask an admin to confirm, but typing /ban <id> directly would just
+    do it. Both must behave the same way.
+    """
+    full_args = dict(args, action=action)
+    if _tool_needs_approval("group_moderation_tool", full_args):
+        approved = await _request_interactive_approval(
+            bot_instance, chat_id, "group_moderation_tool", full_args,
+            requester, chat_info, trigger_text,
+        )
+        if approved is not True:
+            return f"Action '{action}' was not approved, so it did not run."
+    return await _run_moderation(bot_instance, chat_id, full_args)
+
+
 def _member_search_own_scope_ok(
     chat_id: Optional[int], target_chat_id: Optional[int], query_str: str,
 ) -> bool:
