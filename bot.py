@@ -1,7 +1,9 @@
 import io
+import os
 import base64
 import logging
 import asyncio
+from typing import Optional
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.filters import Command, BaseFilter
 from aiogram.filters.callback_data import CallbackData
@@ -16,7 +18,6 @@ import config
 import cache
 import agent
 import models
-import permissions
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,19 @@ class AccessControlMiddleware(BaseMiddleware):
         chat_id = message.chat.id
         chat_type = message.chat.type
 
+        # Record who this is BEFORE any access decision, so member lookup works
+        # for everyone the bot has seen — including people who only ever send
+        # commands, and DM users, both of which the old call site (buried inside
+        # the group-only _speaker_name) never recorded at all.
+        if message.from_user:
+            u = message.from_user
+            cache.track_user(
+                chat_id, u.id,
+                u.full_name or (f"@{u.username}" if u.username else str(u.id)),
+                username=u.username,
+                is_bot=bool(u.is_bot),
+            )
+
         # 1. Private Chat Check (DMs)
         if chat_type == "private":
             if not user_id or not await cache.is_user_allowed(user_id):
@@ -121,11 +135,30 @@ class AccessControlMiddleware(BaseMiddleware):
         text = message.text or message.caption or ""
         cmd = text.strip().split()[0].lower() if text.strip() else ""
 
-        # Admin & system control commands allowed in inactive groups
-        allowed_group_cmds = ["/activate", "/deactivate", "/allow_user", "/disallow_user", "/start", "/help", "/status", "/set_main_account"]
-        if any(cmd.startswith(c) for c in allowed_group_cmds):
+        # Strip any @botusername suffix ("/help@BrodarAIBot") before matching.
+        cmd = cmd.split("@", 1)[0]
+
+        # Harmless informational commands. These are ADVERTISED to every group
+        # member by set_bot_commands, so silently dropping them for non-admins
+        # meant a member tapped /help and got nothing at all.
+        public_group_cmds = {"/start", "/help", "/status"}
+        if cmd in public_group_cmds:
+            return await handler(event, data)
+
+        # Admin & system control commands, allowed even in an inactive group.
+        # Matched exactly: the old `cmd.startswith(c)` also swallowed anything
+        # sharing a prefix, so /helpme was treated as /help.
+        admin_group_cmds = {
+            "/activate", "/deactivate", "/allow_user", "/disallow_user",
+            "/set_main_account",
+        }
+        if cmd in admin_group_cmds:
             if not user_id or not await cache.is_user_allowed(user_id):
                 logger.info(f"Ignoring admin command '{text}' from unauthorized user {user_id} in group {chat_id}")
+                try:
+                    await message.reply("that one's admin-only.")
+                except Exception:
+                    pass
                 return
             return await handler(event, data)
 
@@ -1103,53 +1136,6 @@ async def cmd_demote(message: Message, bot: Bot):
     res = await group_tools.demote_from_admin(bot, message.chat.id, target_uid)
     await message.reply(res)
 
-# permissions and CallbackQuery imported at top of file
-
-@router.callback_query(permissions.PermCallback.filter())
-async def handle_permission_callback(callback: CallbackQuery, callback_data: permissions.PermCallback, bot: Bot):
-    """Handles inline keyboard responses for permission approval prompts."""
-    # callback.message can be None for very old messages.
-    if not callback.message:
-        await callback.answer("This request is no longer available.", show_alert=True)
-        return
-
-    chat = callback.message.chat
-    user = callback.from_user
-
-    # Access control: callback queries bypass the message middleware, so enforce
-    # here. Group -> must be a group admin. DM -> must be DM-allowlisted.
-    if chat.type != "private":
-        if not await is_sender_admin(callback.message, bot, user_id=user.id):
-            await callback.answer("Only group admins can approve or reject permission requests!", show_alert=True)
-            return
-    else:
-        if not await cache.is_user_allowed(user.id):
-            await callback.answer("You are not authorized.", show_alert=True)
-            return
-
-    req_id = callback_data.req_id
-    action = callback_data.action
-    future = permissions._pending_requests.get(req_id)
-
-    if not future or future.done():
-        await callback.answer("This request has already expired or been processed.", show_alert=True)
-        return
-
-    if action == "approve":
-        future.set_result(True)
-        await callback.answer("Permission Approved!")
-        try:
-            await callback.message.edit_text(f"✅ <b>Permission Approved</b> by @{user.username or user.id}.", parse_mode="HTML")
-        except Exception:
-            pass
-    else:
-        future.set_result(False)
-        await callback.answer("Permission Rejected!")
-        try:
-            await callback.message.edit_text(f"❌ <b>Permission Rejected</b> by @{user.username or user.id}.", parse_mode="HTML")
-        except Exception:
-            pass
-
 @router.message(Command("set_title"))
 async def cmd_set_title(message: Message, bot: Bot):
     """Group admin set title command."""
@@ -1174,12 +1160,9 @@ def _speaker_name(message: Message) -> str:
     u = message.from_user
     if not u:
         return "someone"
-    
+
     name = u.full_name or (f"@{u.username}" if u.username else str(u.id))
-    
-    # Store this user's name and ID in cache for searching later
-    cache.track_user(message.chat.id, u.id, name)
-    
+
     if u.is_bot:
         name = f"[BOT] {name}"
         
@@ -1492,6 +1475,42 @@ def _prune_debounce_keys() -> None:
         _chat_last_msg_time.pop(key, None)
 
 
+# Every command the bot actually implements, derived from the handlers above.
+# Used to tell "a command I don't have" apart from ordinary chat that happens to
+# begin with a slash, so an unknown /command gets a straight answer instead of
+# being handed to the LLM to hallucinate a response about.
+KNOWN_COMMANDS = {
+    "activate", "allow_user", "ban", "cancel", "cancel_all", "clear", "compact",
+    "compress", "deactivate", "demote", "disable_skill", "disallow_user",
+    "enable_skill", "help", "install_skill", "memory", "model", "mute", "new",
+    "new_session", "promote", "sessions", "set_main_account", "set_title",
+    "skills", "start", "status", "stop", "stop_all", "switch_session",
+    "toggle_reply", "toggle_tools", "unban", "uninstall_skill", "unmute",
+}
+
+_COMMAND_RE = _re.compile(r"^/([A-Za-z0-9_]+)(?:@(\S+))?\s*")
+
+
+def unknown_command(message: Message, bot_username: str) -> Optional[str]:
+    """
+    The command name if this message is a slash-command the bot doesn't have.
+
+    Returns None for known commands, for commands addressed to a *different*
+    bot in the group, and for anything that isn't a command.
+    """
+    text = (message.text or message.caption or "").strip()
+    m = _COMMAND_RE.match(text)
+    if not m:
+        return None
+
+    name, addressed_to = m.group(1), m.group(2)
+    if addressed_to and bot_username and addressed_to.lower() != bot_username.lower():
+        return None  # someone else's bot
+    if name.lower() in KNOWN_COMMANDS:
+        return None
+    return name
+
+
 @router.message(ShouldRespondFilter())
 async def handle_chat_message(message: Message, bot: Bot, album: list = None):
     """
@@ -1522,6 +1541,13 @@ async def handle_chat_message(message: Message, bot: Bot, album: list = None):
         cleaned_text = _re.sub(
             _re.escape(f"@{BOT_USERNAME}"), spoken_name, raw_text, flags=_re.IGNORECASE
         ).strip()
+
+    # An unknown /command used to fall through to the LLM, which would
+    # confidently improvise an answer about a feature that doesn't exist.
+    unknown = unknown_command(message, BOT_USERNAME)
+    if unknown:
+        await message.reply(f"i don't have a /{unknown}. try /help.")
+        return
 
     has_media = any(_message_has_media(m) for m in batch)
 

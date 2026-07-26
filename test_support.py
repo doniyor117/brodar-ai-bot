@@ -237,6 +237,50 @@ def install_stubs():
         _stub_aiogram()
 
 
+def read_code(path: str) -> str:
+    """
+    Source with comments and docstrings stripped.
+
+    Assertions like "this pattern no longer appears" must look at code only —
+    the comments explaining what a fix replaced necessarily quote the old
+    broken pattern, and would otherwise match themselves.
+    """
+    import io
+    import tokenize
+
+    with open(path, "rb") as f:
+        src = f.read()
+
+    try:
+        tokens = list(tokenize.tokenize(io.BytesIO(src).readline))
+    except tokenize.TokenError:
+        return src.decode("utf-8", "replace")
+
+    # Token types after which a bare STRING is a docstring rather than a value.
+    # ENCODING must be included: it is the very first token of every file, so
+    # without it the MODULE docstring is never recognised as one.
+    statement_start = {
+        tokenize.ENCODING, tokenize.INDENT, tokenize.DEDENT,
+        tokenize.NEWLINE, tokenize.NL,
+    }
+
+    out, prev_end, prev_type = [], (1, 0), tokenize.ENCODING
+    for tok in tokens:
+        if tok.type in (tokenize.COMMENT, tokenize.ENCODING):
+            continue
+        if tok.type == tokenize.STRING and prev_type in statement_start:
+            prev_type = tokenize.NEWLINE  # a docstring ends its own statement
+            prev_end = tok.end
+            continue
+        if tok.start > prev_end:
+            out.append(" ")
+        out.append(tok.string)
+        prev_end = tok.end
+        prev_type = tok.type
+
+    return "".join(out)
+
+
 # ── duck-typed Telegram objects for the tests themselves ────────────────────
 class FakeUser:
     def __init__(self, id, is_bot=False, username=None, full_name="Someone"):

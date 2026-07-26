@@ -325,30 +325,66 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "group_moderation_tool",
-            "description": "Performs group moderation actions if requested by a group admin. CRITICAL: 'ban' KICKS the user out of the group. If the admin asks to 'restrict', 'silence', or 'ban from writing' for a time, you MUST use 'mute' instead of 'ban'.",
+            "description": (
+                "Group moderation, for group admins. Pick the action carefully: "
+                "'kick_ban' REMOVES the person from the group, 'mute' only stops them "
+                "writing while leaving them in it. If the request is to silence, "
+                "restrict, shut someone up, or stop them posting for a while, that is "
+                "'mute' — never 'kick_ban'."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "Action name: ban (kicks user), unban, mute (restricts writing), unmute, set_title, set_description, pin_message, promote_admin, demote_admin"
+                        "enum": [
+                            "kick_ban", "unban", "mute", "unmute",
+                            "set_title", "set_description",
+                            "pin_message", "unpin_message",
+                            "promote_admin", "demote_admin",
+                        ],
+                        "description": (
+                            "kick_ban = remove them from the group. "
+                            "mute = they stay but can't write (needs duration_seconds). "
+                            "unmute/unban reverse those. "
+                            "set_title/set_description change the group itself. "
+                            "pin_message/unpin_message need message_id. "
+                            "promote_admin/demote_admin change admin status."
+                        ),
                     },
                     "target_user_id": {
                         "type": "integer",
-                        "description": "User ID for moderation action. Use search_group_members first if you don't know it."
+                        "description": (
+                            "The user to act on. REQUIRED for kick_ban, unban, mute, "
+                            "unmute, promote_admin and demote_admin. If you don't know "
+                            "it, call search_group_members first — do not guess and do "
+                            "not pass 0."
+                        ),
+                    },
+                    "message_id": {
+                        "type": "integer",
+                        "description": "The message to pin or unpin. Only for pin_message / unpin_message.",
                     },
                     "target_chat_id": {
                         "type": "integer",
-                        "description": "Optional. The specific group chat ID to perform the action in. Use search_group_members first if you don't know it."
+                        "description": (
+                            "Optional. The group to act in. Defaults to the current chat. "
+                            "From a DM, pass a group's id to act on that group remotely."
+                        ),
                     },
                     "text_param": {
                         "type": "string",
-                        "description": "Text parameter for title, description, or admin custom title"
+                        "description": "New group title, new description, or an admin's custom title.",
                     },
                     "duration_seconds": {
                         "type": "integer",
-                        "description": "Duration in seconds (0 for permanent)"
-                    }
+                        "description": (
+                            "How long a mute or kick_ban lasts. REQUIRED for mute unless "
+                            "the admin explicitly asked for a permanent one. Must be at "
+                            "least 31 — Telegram treats anything shorter as PERMANENT. "
+                            "Use 0 only for a deliberately permanent action."
+                        ),
+                    },
                 },
                 "required": ["action"]
             }
@@ -358,18 +394,25 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "search_group_members",
-            "description": "Searches for members (by name or username) who have recently spoken in a group chat to get their User IDs and Chat IDs for moderation.",
+            "description": (
+                "Look up people the bot has seen, to get their user id and chat id. "
+                "Search by @username, display name, or a numeric id. Call this before "
+                "any moderation action when you don't already know the user id."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_chat_id": {
                         "type": "integer",
-                        "description": "Optional. The specific group chat ID to search in. Omit to search across ALL known groups."
+                        "description": "Optional. Restrict the search to one group. Omit to search every known chat.",
                     },
                     "query": {
                         "type": "string",
-                        "description": "Name or username to search for. Leave empty to list all known members."
-                    }
+                        "description": (
+                            "@username, name, or user id to look for. Partial names work. "
+                            "Leave empty only if you genuinely want to list everyone."
+                        ),
+                    },
                 },
                 "required": []
             }
@@ -608,6 +651,9 @@ def _tool_status_line(tool_name: str, args: Dict[str, Any]) -> str:
         return "🛠️ writing a skill file..."
     if tool_name == "group_moderation_tool":
         return f'👮 group action: {args.get("action", "")}...'
+    if tool_name == "search_group_members":
+        q = (args.get("query") or "").strip()
+        return f'👥 looking up{f" “{q}”" if q else " members"}...'
     return f"🔧 using {tool_name}..."
 
 
@@ -1071,65 +1117,9 @@ async def generate_response(
                 sk_name = args.get("skill_name", "")
                 tool_result = skills.uninstall_skill(sk_name)
             elif tool_name == "group_moderation_tool":
-                if not bot_instance or not chat_id:
-                    tool_result = "Error: Group moderation tool unavailable in this context."
-                else:
-                    import group_tools
-                    def _safe_int(v, default):
-                        try: return int(v)
-                        except: return default
-
-                    act = args.get("action", "")
-                    target_uid = _safe_int(args.get("target_user_id"), 0)
-                    text_p = args.get("text_param", "")
-                    duration = _safe_int(args.get("duration_seconds"), 0)
-                    action_chat_id = _safe_int(args.get("target_chat_id"), chat_id)
-
-                    if act == "ban":
-                        tool_result = await group_tools.ban_member(bot_instance, action_chat_id, target_uid, duration)
-                    elif act == "unban":
-                        tool_result = await group_tools.unban_member(bot_instance, action_chat_id, target_uid)
-                    elif act == "mute":
-                        tool_result = await group_tools.mute_member(bot_instance, action_chat_id, target_uid, duration)
-                    elif act == "unmute":
-                        tool_result = await group_tools.unmute_member(bot_instance, action_chat_id, target_uid)
-                    elif act == "set_title":
-                        tool_result = await group_tools.set_group_title(bot_instance, action_chat_id, text_p)
-                    elif act == "set_description":
-                        tool_result = await group_tools.set_group_description(bot_instance, action_chat_id, text_p)
-                    elif act == "promote_admin":
-                        tool_result = await group_tools.promote_to_admin(bot_instance, action_chat_id, target_uid, text_p or "Admin")
-                    elif act == "demote_admin":
-                        tool_result = await group_tools.demote_from_admin(bot_instance, action_chat_id, target_uid)
-                    elif act == "pin_message":
-                        msg_id = args.get("target_user_id", 0)  # reuse target_user_id field for message_id
-                        tool_result = await group_tools.pin_message(bot_instance, action_chat_id, msg_id)
-                    else:
-                        tool_result = f"Unknown moderation action '{act}'."
+                tool_result = await _run_moderation(bot_instance, chat_id, args)
             elif tool_name == "search_group_members":
-                def _safe_int(v, default):
-                    if v is None: return default
-                    try: return int(v)
-                    except: return default
-                
-                # If target_chat_id is completely omitted, default to None (global search)
-                # If it's provided but invalid, fallback to chat_id
-                action_chat_id = args.get("target_chat_id")
-                if action_chat_id is not None:
-                    action_chat_id = _safe_int(action_chat_id, chat_id)
-                    
-                query = args.get("query", "")
-                results = cache.search_users(action_chat_id, query)
-                if not results:
-                    search_scope = f"chat {action_chat_id}" if action_chat_id else "any known chat"
-                    tool_result = f"No users found in {search_scope} matching '{query}'."
-                else:
-                    lines = [f"{name} (ID: {uid})" for uid, name in results.items()]
-                    search_scope = f"chat {action_chat_id}" if action_chat_id else "all known chats"
-                    if len(lines) > 25:
-                        lines = lines[:25]
-                        lines.append(f"...and {len(results) - 25} more. Please refine your query.")
-                    tool_result = f"Found users in {search_scope}:\n" + "\n".join(lines)
+                tool_result = await _run_member_search(chat_id, args)
             elif tool_name == "image_generate":
                 prompt_text = args.get("prompt", "")
                 try:
@@ -1238,6 +1228,150 @@ def _write_skill_file(sk_name: str, sk_content: str) -> str:
     except Exception as e:
         logger.error(f"Failed to write skill file {safe_name}: {e}")
         return f"Failed to write skill file: {e}"
+
+
+def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    """int(value), or `default` if it isn't one."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# Which moderation actions genuinely need a user, and which need a message.
+_ACTIONS_NEEDING_USER = {
+    "kick_ban", "unban", "mute", "unmute", "promote_admin", "demote_admin",
+}
+_ACTIONS_NEEDING_MESSAGE = {"pin_message"}
+
+# The old enum used "ban" for kick-and-remove, which the model kept reaching for
+# when an admin said "shut them up for ten minutes". Accepted as an alias so an
+# older model habit still resolves to something sane.
+_ACTION_ALIASES = {
+    "ban": "kick_ban",
+    "kick": "kick_ban",
+    "restrict": "mute",
+    "silence": "mute",
+    "unrestrict": "unmute",
+    "unpin": "unpin_message",
+    "pin": "pin_message",
+}
+
+
+async def _run_moderation(bot_instance, chat_id: Optional[int], args: Dict[str, Any]) -> str:
+    """
+    Validate and execute one moderation action.
+
+    Validation happens BEFORE Telegram is called. target_user_id used to default
+    to 0, so a model that hadn't looked the person up sent user_id=0, got back a
+    raw Telegram error string, and narrated it to the group as though something
+    had happened.
+    """
+    if not bot_instance or not chat_id:
+        return "Error: group moderation isn't available in this context."
+
+    import group_tools
+
+    act = (args.get("action") or "").strip().lower()
+    act = _ACTION_ALIASES.get(act, act)
+
+    target_uid = _safe_int(args.get("target_user_id"))
+    message_id = _safe_int(args.get("message_id"))
+    text_p = args.get("text_param") or ""
+    duration = _safe_int(args.get("duration_seconds"), 0) or 0
+    action_chat_id = _safe_int(args.get("target_chat_id"), chat_id)
+
+    if act in _ACTIONS_NEEDING_USER and (target_uid is None or target_uid <= 0):
+        return (
+            f"Error: '{act}' needs a real target_user_id and none was given. "
+            "Call search_group_members to find the user first, then try again. "
+            "Do NOT report this action as done."
+        )
+
+    if act in _ACTIONS_NEEDING_MESSAGE and (message_id is None or message_id <= 0):
+        return (
+            f"Error: '{act}' needs a message_id. If the admin was replying to the "
+            "message they want pinned, use that message's id."
+        )
+
+    if act in ("set_title", "set_description") and not text_p.strip():
+        return f"Error: '{act}' needs text_param — the new {act.split('_')[1]}."
+
+    if act == "mute" and duration <= 0:
+        # Not an error: a permanent mute is legitimate. But say what happened so
+        # the model doesn't describe a permanent mute as temporary.
+        logger.info(f"[chat {chat_id}] mute with no duration -> permanent.")
+
+    if act == "kick_ban":
+        return await group_tools.ban_member(bot_instance, action_chat_id, target_uid, duration)
+    if act == "unban":
+        return await group_tools.unban_member(bot_instance, action_chat_id, target_uid)
+    if act == "mute":
+        return await group_tools.mute_member(bot_instance, action_chat_id, target_uid, duration)
+    if act == "unmute":
+        return await group_tools.unmute_member(bot_instance, action_chat_id, target_uid)
+    if act == "set_title":
+        return await group_tools.set_group_title(bot_instance, action_chat_id, text_p)
+    if act == "set_description":
+        return await group_tools.set_group_description(bot_instance, action_chat_id, text_p)
+    if act == "promote_admin":
+        return await group_tools.promote_to_admin(
+            bot_instance, action_chat_id, target_uid, text_p or "Admin"
+        )
+    if act == "demote_admin":
+        return await group_tools.demote_from_admin(bot_instance, action_chat_id, target_uid)
+    if act == "pin_message":
+        return await group_tools.pin_message(bot_instance, action_chat_id, message_id)
+    if act == "unpin_message":
+        # No message_id means "unpin everything", which is a valid request.
+        return await group_tools.unpin_message(bot_instance, action_chat_id, message_id)
+
+    return (
+        f"Unknown moderation action '{act}'. Valid actions: kick_ban, unban, mute, "
+        "unmute, set_title, set_description, pin_message, unpin_message, "
+        "promote_admin, demote_admin."
+    )
+
+
+async def _run_member_search(chat_id: Optional[int], args: Dict[str, Any]) -> str:
+    """
+    Look up chat members, returning explicit chat_id / user_id fields.
+
+    The result used to be prose like "Bob (in chat -100123) (ID: 456)", forcing
+    the model to parse ids back out of a sentence — and it keyed results by user
+    id alone, so the same person in two groups collapsed into one row and the
+    bot would try to ban them in the wrong chat.
+    """
+    scope_chat_id = _safe_int(args.get("target_chat_id")) if args.get("target_chat_id") is not None else None
+    query = (args.get("query") or "").strip()
+
+    rows = await cache.search_users(scope_chat_id, query, limit=26)
+    scope = f"chat {scope_chat_id}" if scope_chat_id else "all known chats"
+
+    if not rows:
+        return (
+            f"No members found in {scope} matching '{query}'. "
+            "The bot only knows people it has seen send a message. Ask the admin "
+            "to have them say something, or to forward one of their messages."
+        )
+
+    truncated = len(rows) > 25
+    lines = []
+    for r in rows[:25]:
+        name = r.get("full_name") or "(no name)"
+        handle = f"@{r['username']}" if r.get("username") else "(no username)"
+        tag = " [BOT]" if r.get("is_bot") else ""
+        lines.append(
+            f"- name: {name} | username: {handle} | "
+            f"user_id: {r['user_id']} | chat_id: {r['chat_id']}{tag}"
+        )
+
+    out = f"Members found in {scope}:\n" + "\n".join(lines)
+    if truncated:
+        out += "\n(more matches exist — narrow the query)"
+    return out
 
 
 async def _run_search(query: str) -> str:

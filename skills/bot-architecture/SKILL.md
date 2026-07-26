@@ -22,24 +22,24 @@ This skill provides you with a comprehensive map of your own source code, explai
 ### `agent.py` (The LLM Engine & Logic)
 - **Role**: Forms the brain of the bot, connecting to LLMs via `litellm`.
 - **Key Features**:
-  - Builds the large `system_prompt` by combining `PERSONA.md`, `MEMORY.md`, date/time, and Master Admin instructions.
+  - Builds the system prompt in `build_system_prompt()` from ordered blocks: `PERSONA.md` (split on a GROUP-ONLY marker so group rules are omitted in DMs), the current date, `MEMORY.md` learned facts, available skills, chat mode, and whether the requester is an admin. There is ONE persona — privilege changes what a person may order, never how the bot talks.
   - Defines the `TOOLS_SCHEMA` (JSON schema for function calling).
   - Contains the tool execution loop (`generate_response_loop`). When a tool is called, it executes the local python function and feeds the result back to the LLM.
-  - Implements `_request_interactive_approval()` using `asyncio.Future` to pause the tool loop until the Telegram callback query in `bot.py` triggers the future.
+  - Implements `_request_interactive_approval()` using `asyncio.Future` to pause the tool loop until an authorized admin taps the inline button handled by `bot.handle_approval`. It fails CLOSED: a timeout, a send failure or a deny all return False. Only genuinely irreversible tools (env, persona, skill install/uninstall) ask; moderation the admin just requested runs immediately.
   - Executes self-management tools (`edit_env_file`, `manage_skill_file`, `edit_memory_file`).
 
 ### `cache.py` (In-Memory State)
 - **Role**: Temporarily holds data that must be fast and transient.
 - **Key Features**:
   - `_history_cache`: A `deque` of recent messages per chat.
-  - `_user_names_cache`: Maps `chat_id` -> `user_id` -> `name`. Populated on every incoming message. This enables the `search_group_members` tool so you can find a member's ID by name for moderation.
+  - `_member_cache`: a write-through mirror of the `chat_members` Postgres table, populated from every incoming message (commands and DMs included). The DATABASE is the source of truth, so member lookup survives a restart — `search_group_members` queries it and returns structured `user_id` / `chat_id` fields.
   - Visual memory tracking (managing how long images stay in context).
 
 ### `db.py` (The Persistence Layer)
 - **Role**: Asynchronous connection to the Neon Serverless PostgreSQL database via `asyncpg`.
 - **Key Features**:
-  - Maintains a small connection pool (`max_size=5`).
-  - Stores `messages` (long-term history), `allowed_users` (for whitelisting if active), and `memory_store` (syncing `MEMORY.md` to Postgres to survive container restarts).
+  - Maintains a connection pool (`max_size=10`); every `acquire()` is timeout-bounded.
+  - Stores `messages` (long-term history), `allowed_users`, `chats` (per-chat settings and turn counters), `chat_members` (who the bot has seen, for ID lookup), `recent_visuals` (retained media, tagged image/audio), `sessions`/`session_summaries`, and `memory_store` (syncing `MEMORY.md` and runtime persona edits to Postgres so they survive redeploys).
 
 ### `tools.py` (Web Search & Terminal)
 - **Role**: Provides external data gathering capabilities.

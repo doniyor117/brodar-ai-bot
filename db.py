@@ -44,6 +44,23 @@ SCHEMA_STATEMENTS = [
     # image rows on read-back and got rebuilt as image content blocks.
     "ALTER TABLE recent_visuals ADD COLUMN IF NOT EXISTS kind VARCHAR(16) DEFAULT 'image' NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_recent_visuals_chat_turn ON recent_visuals (chat_id, turn)",
+    # Who the bot has seen, per chat. This used to be an in-process dict with no
+    # table behind it at all — and on Render's free tier the process sleeps
+    # constantly, so the lookup table was empty most of the time. That is why
+    # "find the id of @someone" reliably failed.
+    """
+    CREATE TABLE IF NOT EXISTS chat_members (
+        chat_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        username TEXT,
+        full_name TEXT,
+        is_bot BOOLEAN DEFAULT FALSE NOT NULL,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        PRIMARY KEY (chat_id, user_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_chat_members_username ON chat_members (lower(username))",
     """
     CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -371,6 +388,68 @@ async def prune_recent_visuals(chat_id: int, min_turn: int) -> None:
             "DELETE FROM recent_visuals WHERE chat_id = $1 AND turn < $2",
             chat_id, min_turn,
         )
+
+
+async def upsert_chat_member(
+    chat_id: int, user_id: int, username: Optional[str],
+    full_name: Optional[str], is_bot: bool = False,
+) -> None:
+    """Record (or refresh) one person's presence in a chat."""
+    pool = get_pool()
+    async with pool.acquire(timeout=config.DB_ACQUIRE_TIMEOUT) as conn:
+        await conn.execute(
+            """
+            INSERT INTO chat_members (chat_id, user_id, username, full_name, is_bot, last_seen)
+            VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+            ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                username  = COALESCE(EXCLUDED.username, chat_members.username),
+                full_name = COALESCE(EXCLUDED.full_name, chat_members.full_name),
+                is_bot    = EXCLUDED.is_bot,
+                last_seen = CURRENT_TIMESTAMP
+            """,
+            chat_id, user_id, username, full_name, is_bot,
+        )
+
+
+async def search_chat_members(
+    chat_id: Optional[int], query: str, limit: int = 25,
+) -> List[Dict[str, Any]]:
+    """
+    Find members by username, display name, or user id.
+
+    Returns structured rows — real chat_id and user_id fields, not a prose
+    string the model has to regex an id back out of.
+    """
+    pool = get_pool()
+    q = (query or "").strip().lstrip("@").lower()
+
+    conditions, params = [], []
+    if chat_id is not None:
+        params.append(chat_id)
+        conditions.append(f"chat_id = ${len(params)}")
+    if q:
+        params.append(f"%{q}%")
+        idx = len(params)
+        clause = f"(lower(username) LIKE ${idx} OR lower(full_name) LIKE ${idx}"
+        if q.lstrip("-").isdigit():
+            params.append(int(q))
+            clause += f" OR user_id = ${len(params)}"
+        conditions.append(clause + ")")
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+
+    async with pool.acquire(timeout=config.DB_ACQUIRE_TIMEOUT) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT chat_id, user_id, username, full_name, is_bot, last_seen
+            FROM chat_members {where}
+            ORDER BY last_seen DESC
+            LIMIT ${len(params)}
+            """,
+            *params,
+        )
+        return [dict(r) for r in rows]
 
 
 async def clear_recent_visuals(chat_id: int) -> None:

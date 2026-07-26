@@ -201,16 +201,13 @@ def test_media_is_async():
     check("extract_frames is async", inspect.iscoroutinefunction(media.extract_frames))
     check("extract_audio is async", inspect.iscoroutinefunction(media.extract_audio))
 
-    # Check executable lines only — the module docstring describes the old
-    # blocking implementation it replaced, and would otherwise match.
-    code = "\n".join(
-        l for l in open("media.py").read().split("\n")
-        if not l.lstrip().startswith("#")
-    )
+    # Check executable code only — the module docstring describes the old
+    # blocking implementation it replaced, and would otherwise match itself.
+    code = test_support.read_code("media.py")
     check("the blocking subprocess module is not even imported",
           "import subprocess" not in code)
-    check("nothing calls subprocess.run(", "subprocess.run(" not in code)
-    check("it never uses the shared thread pool", "to_thread(" not in code)
+    check("nothing calls subprocess.run", "subprocess . run" not in code)
+    check("it never uses the shared thread pool", "to_thread" not in code)
 
     src = open("media.py").read()
     check("it uses cancellable async subprocesses",

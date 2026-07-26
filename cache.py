@@ -24,35 +24,77 @@ HISTORY_MAXLEN = config.HISTORY_MAXLEN
 # Strong references to background DB-write tasks. Without this the event loop
 # only weakly references them and the GC can cancel a write before it lands.
 
-# Maps chat_id (int) -> user_id (int) -> username/full_name string
-_user_names_cache: Dict[int, Dict[int, str]] = {}
+# Write-through memory of who we've seen, so a lookup right after a message
+# doesn't have to wait on Postgres. The DATABASE is the source of truth — this
+# used to be the only store, with no table behind it, so every Render sleep
+# wiped the bot's knowledge of everyone in the group.
+# Maps chat_id -> user_id -> {"username", "full_name", "is_bot"}
+_member_cache: Dict[int, Dict[int, dict]] = {}
+_MEMBER_CACHE_CHAT_LIMIT = 200
 
-def track_user(chat_id: int, user_id: int, name: str):
-    if chat_id not in _user_names_cache:
-        _user_names_cache[chat_id] = {}
-    _user_names_cache[chat_id][user_id] = name
-    
-def search_users(chat_id: Optional[int] = None, query: str = "") -> dict:
-    results = {}
-    q = query.lower() if query else ""
-    
-    # If chat_id is provided, only search that chat
-    if chat_id is not None:
-        if chat_id not in _user_names_cache:
-            return {}
-        chats_to_search = {chat_id: _user_names_cache[chat_id]}
-    else:
-        # Otherwise search all known chats
-        chats_to_search = _user_names_cache
 
-    for cid, users in chats_to_search.items():
-        for uid, name in users.items():
-            if not q or q in name.lower() or q in str(uid):
-                # We prefix the name with the chat_id in global searches to differentiate
-                display_name = f"{name} (in chat {cid})" if chat_id is None else name
-                results[uid] = display_name
-                
-    return results
+def track_user(chat_id: int, user_id: int, name: str,
+               username: Optional[str] = None, is_bot: bool = False) -> None:
+    """
+    Record that a user was seen in a chat, in memory and in Postgres.
+
+    Called from every incoming message — including commands and DMs, which the
+    old call site skipped, so anyone who only ever sent commands was invisible
+    to the lookup tool.
+    """
+    if not chat_id or not user_id:
+        return
+
+    chat = _member_cache.setdefault(chat_id, {})
+    existing = chat.get(user_id, {})
+    record = {
+        "username": username or existing.get("username"),
+        "full_name": name or existing.get("full_name"),
+        "is_bot": is_bot,
+    }
+    chat[user_id] = record
+
+    if len(_member_cache) > _MEMBER_CACHE_CHAT_LIMIT:
+        _member_cache.pop(next(iter(_member_cache)), None)
+
+    _spawn_db_write(db.upsert_chat_member(
+        chat_id, user_id, record["username"], record["full_name"], is_bot,
+    ))
+
+
+async def search_users(chat_id: Optional[int] = None, query: str = "",
+                       limit: int = 25) -> List[dict]:
+    """
+    Find members by @username, display name, or user id.
+
+    Returns a list of structured records with real chat_id / user_id fields.
+    The old version returned {user_id: "name (in chat -100…)"}, which both
+    collapsed the same person across different chats into one entry and forced
+    the model to parse the chat id back out of an English sentence.
+    """
+    try:
+        rows = await db.search_chat_members(chat_id, query, limit)
+        if rows:
+            return rows
+    except Exception as e:
+        logger.error(f"search_chat_members failed: {e}")
+
+    # Fall back to whatever this process has seen since it started.
+    q = (query or "").strip().lstrip("@").lower()
+    chats = ({chat_id: _member_cache.get(chat_id, {})} if chat_id is not None
+             else _member_cache)
+    out = []
+    for cid, users in chats.items():
+        for uid, rec in users.items():
+            haystack = f"{rec.get('username') or ''} {rec.get('full_name') or ''} {uid}".lower()
+            if not q or q in haystack:
+                out.append({
+                    "chat_id": cid, "user_id": uid,
+                    "username": rec.get("username"),
+                    "full_name": rec.get("full_name"),
+                    "is_bot": rec.get("is_bot", False),
+                })
+    return out[:limit]
 _write_tasks: set = set()
 
 def _spawn_db_write(coro) -> None:
