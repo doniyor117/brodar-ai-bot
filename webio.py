@@ -32,7 +32,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = "ClaireBot/1.0 (+telegram)"
+_USER_AGENT = "BrodarBot/1.0 (+telegram)"
 
 # ── SSRF guard ───────────────────────────────────────────────────────────────
 

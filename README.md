@@ -202,20 +202,21 @@ Entries below are historical — each describes the state *at that date*, not
 necessarily today's. For current behavior, read section 6 and the module docstrings;
 `git log` has the full detail behind every fix.
 
-### Rebrand to Claire; Phase 10 — web fetch, download, deliver (2026-07-30)
-The project moved to a new repo under the name **claire**, with the bot's own
-identity (persona, in-code voice references, test fixtures, skill docs) renamed
-to match — see `PERSONA.md`. Separately, added `webio.py` with two new tools:
-`fetch_url` (reads a page/API response as text, HTML reduced to readable text)
-and `download_url` (saves a file into the chat's workspace, per-chat quota with
-LRU eviction). Both go through a shared SSRF guard — rejects non-http(s)
-schemes, embedded credentials, non-standard ports, and any hostname that
-resolves to a private/loopback/link-local/CGNAT/multicast/reserved address,
-re-checked on every redirect hop. `send_file` gained extension-based type
-inference and pre-upload size checks, and can now take an `http(s)://` URL
-directly (Telegram fetches it, no local download) as an alternative to
-`download_url` + a local path. Also closed a bare-IP-literal hole in the
-`curl` shell tool's allowlist regex.
+### Phase 10 — web fetch, download, deliver (2026-07-30)
+Added `webio.py` with two new tools: `fetch_url` (reads a page/API response as
+text, HTML reduced to readable text) and `download_url` (saves a file into the
+chat's workspace, per-chat quota with LRU eviction). Both go through a shared
+SSRF guard — rejects non-http(s) schemes, embedded credentials, non-standard
+ports, and any hostname that resolves to a private/loopback/link-local/CGNAT/
+multicast/reserved address, re-checked on every redirect hop. `send_file`
+gained extension-based type inference and pre-upload size checks, and can now
+take an `http(s)://` URL directly (Telegram fetches it, no local download) as
+an alternative to `download_url` + a local path. Also closed a bare-IP-literal
+hole in the `curl` shell tool's allowlist regex.
+
+This is this project's final phase — active development continues in a new
+repo under the name **claire**, which carries this history forward. See that
+project for phases 11b onward.
 
 ### Recovery plan, phases 1–9 (2026-07-26)
 A large prior session had added many features that didn't actually work end to end.
