@@ -168,6 +168,27 @@ TOOL_WORKSPACE_DIR = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
 )
 
+# ── Web fetch / download (webio.py) ─────────────────────────────────────────
+# fetch_url: reads a page/API response as text. Small and short-lived — this
+# runs inline in a tool loop the user is waiting on.
+FETCH_TIMEOUT_SECONDS = float(os.getenv("FETCH_TIMEOUT_SECONDS", "15"))
+FETCH_MAX_BYTES = int(os.getenv("FETCH_MAX_BYTES", str(2 * 1024 * 1024)))
+FETCH_MAX_REDIRECTS = int(os.getenv("FETCH_MAX_REDIRECTS", "3"))
+
+# download_url: saves a file into workspace/downloads/<chat_id>/. Bigger and
+# slower than a fetch, so it gets its own budget rather than reusing fetch's.
+DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "60"))
+DOWNLOAD_MAX_BYTES = int(os.getenv("DOWNLOAD_MAX_BYTES", str(45 * 1024 * 1024)))
+# Per-chat total across every file in its downloads/ folder. Oldest-accessed
+# files are evicted first once a new download would exceed this.
+DOWNLOAD_CHAT_QUOTA_BYTES = int(os.getenv("DOWNLOAD_CHAT_QUOTA_BYTES", str(200 * 1024 * 1024)))
+
+# send_file: pre-upload size checks, so an oversized file fails with a plain
+# message instead of a raw Telegram API error. Telegram's own hard ceilings
+# for a bot-uploaded file are 10MB (photo) / 50MB (document, audio, video).
+SEND_FILE_MAX_PHOTO_BYTES = int(os.getenv("SEND_FILE_MAX_PHOTO_BYTES", str(10 * 1024 * 1024)))
+SEND_FILE_MAX_DOCUMENT_BYTES = int(os.getenv("SEND_FILE_MAX_DOCUMENT_BYTES", str(50 * 1024 * 1024)))
+
 # Placeholder values shipped in .env.example / render.yaml. Treating these as
 # "configured" is what silently breaks the webhook, so we detect them explicitly.
 _PLACEHOLDER_MARKERS = (

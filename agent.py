@@ -10,6 +10,7 @@ import memory
 import skills
 import models
 import cache
+import webio
 
 logger = logging.getLogger(__name__)
 
@@ -616,24 +617,93 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "send_file",
-            "description": "Sends a local file (document, photo, audio, video) to the current chat.",
+            "description": (
+                "Sends a file (document, photo, audio, video) to the current chat. "
+                "file_path is either a workspace-relative/absolute local path (e.g. "
+                "one just written by download_url), or an http(s):// URL — in which "
+                "case Telegram fetches it directly, subject to Telegram's own "
+                "by-URL size ceiling (roughly 20MB document / 5MB photo). For a "
+                "bigger remote file, use download_url first, then send_file with "
+                "the local path it returns."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to the local file to send."
+                        "description": "A local path (workspace-relative or absolute) or an http(s):// URL."
                     },
                     "file_type": {
                         "type": "string",
-                        "description": "Type of file: 'document', 'photo', 'video', or 'audio'."
+                        "description": (
+                            "'document', 'photo', 'video', or 'audio'. Omit or pass "
+                            "'auto' to infer it from the file extension."
+                        )
                     },
                     "caption": {
                         "type": "string",
                         "description": "Optional caption for the file."
                     }
                 },
-                "required": ["file_path", "file_type"]
+                "required": ["file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "Fetches a web page or raw URL and returns its content as text. "
+                "Use this to read an article, doc, or API response you have a "
+                "link to. NOT for images/video/audio/archives/binaries — those "
+                "have no useful text form; use download_url for those instead. "
+                "Refuses URLs that resolve to an internal/private network address."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The http(s) URL to fetch."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["text", "raw", "headers"],
+                        "description": (
+                            "'text' (default): HTML reduced to readable text. "
+                            "'raw': the body as-is, no HTML stripping — for JSON/XML/plain text. "
+                            "'headers': just the status code and response headers, no body."
+                        )
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_url",
+            "description": (
+                "Downloads a URL's content (image, video, audio, document, "
+                "archive — anything binary) into this chat's workspace folder so "
+                "it can be delivered with send_file or inspected with a shell "
+                "tool. Not for reading a page's text — use fetch_url for that."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The http(s) URL to download."
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional filename to save as. Defaults to the name in the URL."
+                    }
+                },
+                "required": ["url"]
             }
         }
     }
@@ -825,6 +895,12 @@ def _tool_status_line(tool_name: str, args: Dict[str, Any]) -> str:
     if tool_name == "search_group_members":
         q = (args.get("query") or "").strip()
         return f'👥 looking up{f" “{q}”" if q else " members"}...'
+    if tool_name == "fetch_url":
+        u = (args.get("url") or "").strip()
+        return f"🌐 fetching {u}..." if u else "🌐 fetching a page..."
+    if tool_name == "download_url":
+        u = (args.get("url") or "").strip()
+        return f"⬇️ downloading {u}..." if u else "⬇️ downloading a file..."
     return f"🔧 using {tool_name}..."
 
 
@@ -1486,34 +1562,43 @@ async def generate_response(
                     tool_result = "Error: send_file unavailable in this context."
                 else:
                     file_path = args.get("file_path", "")
-                    file_type = args.get("file_type", "document")
+                    file_type = args.get("file_type", "")
                     caption = args.get("caption", "")
-                    try:
-                        import os
-                        from aiogram.types import FSInputFile
-                        resolved = _resolve_sendable_path(file_path)
-                        if resolved is None:
-                            tool_result = (
-                                f"Error: '{file_path}' is outside the workspace. You may only "
-                                f"send files from the workspace directory."
+                    file_input, display_path, file_type, precheck_error = _send_file_precheck(file_path, file_type)
+                    if precheck_error:
+                        tool_result = precheck_error
+                    else:
+                        try:
+                            from aiogram.types import FSInputFile
+                            # A local path still needs wrapping; an http(s) URL
+                            # is passed straight through for Telegram to fetch.
+                            is_remote = isinstance(file_input, str) and (
+                                file_input.startswith("http://") or file_input.startswith("https://")
                             )
-                        elif not os.path.isfile(resolved):
-                            tool_result = f"Error: File '{file_path}' does not exist."
-                        else:
-                            file_path = resolved
-                            file_input = FSInputFile(file_path)
+                            send_payload = file_input if is_remote else FSInputFile(file_input)
                             if file_type == "photo":
-                                await bot_instance.send_photo(chat_id, photo=file_input, caption=caption)
+                                await bot_instance.send_photo(chat_id, photo=send_payload, caption=caption)
                             elif file_type == "video":
-                                await bot_instance.send_video(chat_id, video=file_input, caption=caption)
+                                await bot_instance.send_video(chat_id, video=send_payload, caption=caption)
                             elif file_type == "audio":
-                                await bot_instance.send_audio(chat_id, audio=file_input, caption=caption)
+                                await bot_instance.send_audio(chat_id, audio=send_payload, caption=caption)
                             else:
-                                await bot_instance.send_document(chat_id, document=file_input, caption=caption)
-                            tool_result = f"Successfully sent {file_type} from {file_path} to chat."
-                    except Exception as e:
-                        logger.error(f"Failed to send file {file_path}: {e}")
-                        tool_result = f"Failed to send file: {e}"
+                                await bot_instance.send_document(chat_id, document=send_payload, caption=caption)
+                            tool_result = f"Successfully sent {file_type} from {display_path} to chat."
+                        except Exception as e:
+                            logger.error(f"Failed to send file {display_path}: {e}")
+                            tool_result = f"Failed to send file: {e}"
+            elif tool_name == "fetch_url":
+                url_arg = args.get("url", "")
+                mode_arg = args.get("mode") or "text"
+                # Blocking network I/O — same reasoning as install_skill_from_url.
+                fetch_result = await asyncio.to_thread(webio.fetch_url, url_arg, mode_arg)
+                tool_result = _format_fetch_result(fetch_result)
+            elif tool_name == "download_url":
+                url_arg = args.get("url", "")
+                filename_arg = args.get("filename")
+                download_result = await asyncio.to_thread(webio.download_url, url_arg, chat_id, filename_arg)
+                tool_result = _format_download_result(download_result)
             else:
                 tool_result = f"Error: Unknown tool '{tool_name}'."
 
@@ -1933,6 +2018,96 @@ def _resolve_sendable_path(file_path: str) -> Optional[str]:
         logger.warning(f"Blocked send_file path escaping workspace: {file_path!r} -> {resolved}")
         return None
     return resolved
+
+
+_PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+_AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".oga", ".m4a", ".flac"}
+
+
+def _infer_file_type(path: str) -> str:
+    """Guess send_file's file_type from the extension. Defaults to 'document'."""
+    import os
+
+    ext = os.path.splitext(path.split("?", 1)[0])[1].lower()
+    if ext in _PHOTO_EXTS:
+        return "photo"
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _AUDIO_EXTS:
+        return "audio"
+    return "document"
+
+
+def _send_file_precheck(file_path: str, file_type: str):
+    """
+    Resolve and validate a send_file request before any Telegram call is made.
+
+    Returns (file_input, display_path, resolved_file_type, error). `file_input`
+    is either the original http(s) URL (Telegram fetches it directly) or a
+    local absolute path — or None if `error` is set. Kept separate from the
+    dispatch loop so the local-path/size-limit logic is unit-testable without
+    a bot_instance.
+    """
+    import os
+
+    file_path = (file_path or "").strip()
+    if not file_path:
+        return None, None, file_type, "Error: file_path is required."
+
+    resolved_type = file_type if file_type and file_type != "auto" else _infer_file_type(file_path)
+
+    if file_path.startswith("http://") or file_path.startswith("https://"):
+        # Telegram's own servers fetch it — no local disk/bandwidth spent, and
+        # no SSRF exposure on our side. Bounded by Telegram's own by-URL
+        # ceilings; a file too big for that needs download_url first instead.
+        return file_path, file_path, resolved_type, None
+
+    resolved = _resolve_sendable_path(file_path)
+    if resolved is None:
+        return None, None, resolved_type, (
+            f"Error: '{file_path}' is outside the workspace. You may only send "
+            f"local files from the workspace directory, or pass an http(s):// URL directly."
+        )
+    if not os.path.isfile(resolved):
+        return None, None, resolved_type, f"Error: File '{file_path}' does not exist."
+
+    size = os.path.getsize(resolved)
+    limit = config.SEND_FILE_MAX_PHOTO_BYTES if resolved_type == "photo" else config.SEND_FILE_MAX_DOCUMENT_BYTES
+    if size > limit:
+        hint = "try sending it as a document instead." if resolved_type == "photo" else "it's too big to send at all."
+        return None, None, resolved_type, (
+            f"Error: '{os.path.basename(resolved)}' is {size:,} bytes, over the "
+            f"{limit:,} byte limit for a {resolved_type}. {hint}"
+        )
+
+    return resolved, resolved, resolved_type, None
+
+
+def _format_fetch_result(result: Dict[str, Any]) -> str:
+    """Turn webio.fetch_url's dict into a tool-result string for the LLM."""
+    if not result.get("ok"):
+        return f"Fetch Error: {result.get('error', 'unknown error')}"
+
+    if result.get("mode") == "headers":
+        lines = [f"{result['status']} {result['url']}", f"content-type: {result.get('content_type', '')}"]
+        for k, v in result.get("headers", {}).items():
+            lines.append(f"{k}: {v}")
+        return "\n".join(lines)
+
+    truncated_note = " [truncated to the size limit]" if result.get("truncated") else ""
+    return f"Fetched {result['url']} ({result['status']}){truncated_note}:\n\n{result.get('text', '')}"
+
+
+def _format_download_result(result: Dict[str, Any]) -> str:
+    """Turn webio.download_url's dict into a tool-result string for the LLM."""
+    if not result.get("ok"):
+        return f"Download Error: {result.get('error', 'unknown error')}"
+    return (
+        f"Downloaded {result['url']} -> {result['path']} "
+        f"({result['size']:,} bytes, {result.get('content_type', 'unknown type')}). "
+        f"Use send_file with this path to deliver it."
+    )
 
 
 def search_web_wrapper(query: str) -> str:

@@ -71,7 +71,13 @@ ALLOWED_COMMANDS = {
     },
     "curl": {
         "bin": "curl",
-        "args_regex": r"^-[I]\s+https://[a-zA-Z0-9.-]+$",
+        # The lookahead requires at least one letter in the host, so a bare IP
+        # literal (e.g. https://169.254.169.254, the cloud metadata address)
+        # never matches — only real hostnames do. This is not full SSRF
+        # protection (a hostname can still resolve to an internal address);
+        # that's what webio.py's fetch_url/download_url are for. This just
+        # closes the direct-IP shortcut for this one shell-level tool.
+        "args_regex": r"^-[I]\s+https://(?=[a-zA-Z0-9.-]*[a-zA-Z])[a-zA-Z0-9.-]+$",
         "description": "Fetches HTTP headers for safe domains."
     },
     "ls": {
